@@ -9,6 +9,8 @@ import aiohttp
 import numpy as np
 import requests
 from rl_agent import ACTIONS, RLAgent
+from rl_calibration import (CalibrationData, load_calibration, save_calibration,
+                             invalidate_cache, CALIB_STEPS, CALIB_SETTLE)
 from flask import Flask, jsonify, render_template
 from flask import request as freq
 
@@ -118,12 +120,109 @@ _rl_last_action_ts: float = 0.0
 _rl_lock = threading.Lock()
 _sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
 
+_calib_lock = threading.Lock()
+_calib_status: dict = {
+    "running":            False,
+    "step":               0,
+    "total":              len(CALIB_STEPS),
+    "current_brightness": None,
+    "points":             [],
+    "error":              None,
+    "timestamp":          None,
+}
+
 
 def _get_rl_agent() -> RLAgent:
     global _rl_agent
     if _rl_agent is None:
         _rl_agent = RLAgent()
     return _rl_agent
+
+
+def _set_rl_brightness_rest(brightness_pct: float, lights: list) -> None:
+    """Command lights via REST and update the RL brightness tracker."""
+    global _rl_brightness
+    new_br = float(np.clip(brightness_pct, 5, 100))
+    with _rl_lock:
+        _rl_brightness = new_br
+    b255 = int(new_br / 100 * 255)
+    for lid in lights:
+        ha_post("/services/light/turn_on", {"entity_id": lid, "brightness": b255})
+
+
+def _run_calibration_thread() -> None:
+    """Sweep brightness 0→100 %, measure lux at each step, save curve."""
+    global _calib_status
+    cfg     = load_config()
+    lights  = cfg.get("rl_output_lights", [])
+    sensors = cfg.get("rl_input_sensors", [])
+
+    if not lights or not sensors:
+        with _calib_lock:
+            _calib_status.update(running=False,
+                                  error="Nejsou nastavena výstupní světla nebo vstupní senzory RL")
+        return
+
+    with _calib_lock:
+        _calib_status.update(running=True, step=0, points=[], error=None,
+                              current_brightness=None, timestamp=None)
+
+    points = []
+    try:
+        for i, pct in enumerate(CALIB_STEPS):
+            with _calib_lock:
+                _calib_status.update(step=i + 1, current_brightness=pct)
+
+            if pct == 0:
+                for lid in lights:
+                    ha_post("/services/light/turn_off", {"entity_id": lid})
+            else:
+                b255 = int(pct / 100 * 255)
+                for lid in lights:
+                    ha_post("/services/light/turn_on",
+                            {"entity_id": lid, "brightness": b255})
+
+            time.sleep(CALIB_SETTLE)
+
+            lux_vals = []
+            for sid in sensors:
+                st = ha_get(f"/states/{sid}")
+                if st:
+                    try:
+                        lux_vals.append(float(st["state"]))
+                    except (ValueError, TypeError):
+                        pass
+
+            if lux_vals:
+                avg = sum(lux_vals) / len(lux_vals)
+                pt  = {"brightness": pct, "lux": round(avg, 2)}
+                points.append(pt)
+                with _calib_lock:
+                    _calib_status["points"] = list(points)
+                app.logger.info("Calib %d%%: %.2f lx", pct, avg)
+
+        ts    = _now()
+        calib = CalibrationData(points, timestamp=ts)
+        save_calibration(calib)
+
+        with _calib_lock:
+            _calib_status.update(running=False, step=len(CALIB_STEPS),
+                                  error=None, timestamp=ts)
+
+        # Immediately set lamp to curve brightness for current target
+        cfg2   = load_config()
+        target = float(cfg2.get("rl_target_lux", 100))
+        _set_rl_brightness_rest(calib.brightness_for_lux(target), lights)
+        # Reset RL so it fine-tunes from the new starting point
+        agent = _get_rl_agent()
+        agent.memory.clear()
+        agent.prev_state = None
+        agent.prev_lux   = None
+
+    except Exception as exc:
+        with _calib_lock:
+            _calib_status.update(running=False, error=str(exc))
+        app.logger.error("Calibration failed: %s", exc)
 
 
 def _init_sun_elevation() -> None:
@@ -247,7 +346,22 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         if _sun_elevation > float(cfg.get("rl_sun_threshold", 0.0)):
             return
 
+    # Block RL while calibration sweep is running
+    with _calib_lock:
+        if _calib_status["running"]:
+            return
+
     agent = _get_rl_agent()
+
+    # Warm start: on first action use calibration curve instead of 50 % default
+    calib = load_calibration()
+    if calib and agent.prev_state is None:
+        approx_br = calib.brightness_for_lux(target)
+        with _rl_lock:
+            _rl_brightness = float(np.clip(approx_br, 5, 100))
+        app.logger.info("RL warm-start: target %.1f lx → %.0f%% brightness (from curve)",
+                        target, approx_br)
+
     with _rl_lock:
         cur_br = _rl_brightness
 
@@ -475,14 +589,21 @@ def post_config():
         if k in DEFAULT_CONFIG:
             cfg[k] = v
     save_config(cfg)
-    if cfg.get("rl_target_lux") != old_target:
+    target_changed = cfg.get("rl_target_lux") != old_target
+    if target_changed:
         agent = _get_rl_agent()
         agent.memory.clear()
         agent.prev_state = None
-        agent.prev_lux = None
-        app.logger.info("RL target changed %s→%s: replay buffer flushed", old_target, cfg["rl_target_lux"])
+        agent.prev_lux   = None
+        app.logger.info("RL target changed %s→%s: replay buffer flushed",
+                        old_target, cfg["rl_target_lux"])
+        calib = load_calibration()
+        if calib:
+            lights = cfg.get("rl_output_lights", [])
+            _set_rl_brightness_rest(
+                calib.brightness_for_lux(float(cfg["rl_target_lux"])), lights)
     threading.Thread(target=run_automation_once, daemon=True).start()
-    return jsonify({"ok": True, "buffer_flushed": cfg.get("rl_target_lux") != old_target})
+    return jsonify({"ok": True, "buffer_flushed": target_changed})
 
 
 @app.route("/api/automation/status")
@@ -500,12 +621,15 @@ def automation_run():
 
 @app.route("/api/rl/status")
 def rl_status():
-    cfg      = load_config()
-    agent    = _get_rl_agent()
-    night    = cfg.get("rl_night_only", False)
-    sun_thr  = float(cfg.get("rl_sun_threshold", 0.0))
+    cfg     = load_config()
+    agent   = _get_rl_agent()
+    night   = cfg.get("rl_night_only", False)
+    sun_thr = float(cfg.get("rl_sun_threshold", 0.0))
     with _rl_lock:
         br = _rl_brightness
+    with _calib_lock:
+        calib_running = _calib_status["running"]
+    calib = load_calibration()
     return jsonify({
         **agent.info(),
         "enabled":            cfg.get("rl_enabled", False),
@@ -513,6 +637,9 @@ def rl_status():
         "current_brightness": round(br, 1),
         "sun_elevation":      round(_sun_elevation, 1),
         "blocked_by_sun":     night and (_sun_elevation > sun_thr),
+        "calibrated":         calib is not None,
+        "calib_running":      calib_running,
+        "calib_max_lux":      round(calib.max_lux, 1) if calib else None,
     })
 
 
@@ -524,6 +651,49 @@ def rl_reset():
     except FileNotFoundError:
         pass
     return jsonify({"ok": True})
+
+
+@app.route("/api/rl/calibration")
+def rl_calibration_get():
+    with _calib_lock:
+        status = dict(_calib_status)
+    calib = load_calibration()
+    return jsonify({
+        "status":      status,
+        "calibration": calib.to_dict() if calib else None,
+    })
+
+
+@app.route("/api/rl/calibrate", methods=["POST"])
+def rl_calibrate():
+    with _calib_lock:
+        if _calib_status["running"]:
+            return jsonify({"error": "Kalibrace již probíhá"}), 409
+    threading.Thread(target=_run_calibration_thread, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rl/target", methods=["POST"])
+def rl_set_target():
+    """Dedicated endpoint for external agents to set target lux instantly."""
+    body = freq.get_json(silent=True)
+    if not body or "target_lux" not in body:
+        return jsonify({"error": "Chybí target_lux"}), 400
+    new_target = float(body["target_lux"])
+    cfg = load_config()
+    old_target = cfg.get("rl_target_lux")
+    cfg["rl_target_lux"] = new_target
+    save_config(cfg)
+    if new_target != old_target:
+        agent = _get_rl_agent()
+        agent.memory.clear()
+        agent.prev_state = None
+        agent.prev_lux   = None
+        calib = load_calibration()
+        if calib:
+            lights = cfg.get("rl_output_lights", [])
+            _set_rl_brightness_rest(calib.brightness_for_lux(new_target), lights)
+    return jsonify({"ok": True, "target_lux": new_target})
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────

@@ -798,6 +798,11 @@ function rlStatsHtml(rl) {
     ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:var(--r-sm);font-size:.78rem;color:var(--accent)">
          ☀️ RL je blokováno — slunce je ještě nad nastaveným prahem
        </div>` : '';
+  const calibOk   = rl.calibrated;
+  const calibMax  = rl.calib_max_lux != null ? rl.calib_max_lux + ' lx' : '—';
+  const calibClr  = calibOk ? 'var(--green)' : 'var(--red)';
+  const calibLbl  = calibOk ? `✔ max ${calibMax}` : '✗ Nekalibrováno';
+
   return `
     <div class="rl-stats-grid">
       <div class="rl-stat"><div class="rl-stat-lbl">Kroky tréninku</div><div class="rl-stat-val">${steps}</div></div>
@@ -807,6 +812,7 @@ function rlStatsHtml(rl) {
       <div class="rl-stat"><div class="rl-stat-lbl">Poslední krok</div><div class="rl-stat-val" style="color:${dColor}">${delta}</div></div>
       <div class="rl-stat"><div class="rl-stat-lbl">Odměna</div><div class="rl-stat-val" style="color:${rColor}">${reward}</div></div>
       <div class="rl-stat"><div class="rl-stat-lbl">Elevace slunce</div><div class="rl-stat-val" style="color:${eColor}">${elev}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Kalibrace</div><div class="rl-stat-val" style="color:${calibClr};font-size:.85rem">${calibLbl}</div></div>
     </div>
     ${blocked}`;
 }
@@ -822,6 +828,7 @@ async function loadRL() {
     _entities = await entResp.json();
     _rlStatus = rlResp.ok ? await rlResp.json() : null;
     renderRL();
+    fetchCalibStatus();
   } catch(e) {
     document.getElementById('rlRoot').innerHTML =
       `<div class="error-box">⚠️ Nelze načíst: ${e.message}</div>`;
@@ -908,6 +915,20 @@ function renderRL() {
               oninput="cfgSet('rl_action_cooldown',+this.value);document.getElementById('rl-cooldown').value=this.value">
             <div class="lux-hint">Minimální čas mezi dvěma RL akcemi. Nižší = rychlejší reakce. Doporučeno: 3–5 s.</div>
           </div>
+        </div>
+      </div>
+
+      <!-- ── Kalibrace ── -->
+      <div class="settings-card">
+        <div class="settings-card-title">📐 Kalibrace světla</div>
+        <div id="calib-content" style="min-height:48px"></div>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button class="btn btn-primary" id="calib-btn" style="flex:1;justify-content:center"
+            onclick="startCalibration()">📐 Spustit kalibraci</button>
+        </div>
+        <div style="margin-top:8px;font-size:.7rem;color:var(--text-muted);line-height:1.5">
+          Změří luxy při ${[0,20,40,60,80,100].join(' / ')} % jasu a uloží křivku pro okamžité
+          nastavení při změně cíle. Proveďte v tmavé místnosti (nejlépe v noci). Trvá ~${6*4} s.
         </div>
       </div>
 
@@ -1008,6 +1029,96 @@ async function resetRLModel() {
   } catch(e) {
     showToast('Chyba: ' + e.message, true);
   }
+}
+
+/* ═══════════════════════════════════════════
+   CALIBRATION
+═══════════════════════════════════════════ */
+let _calibPoll = null;
+
+function renderCalibPoints(points) {
+  if (!points?.length) return '';
+  const rows = points.map(p =>
+    `<tr>
+       <td style="padding:3px 12px;color:var(--accent);text-align:right">${p.brightness} %</td>
+       <td style="padding:3px 12px;color:var(--text-dim)">${(+p.lux).toFixed(2)} lx</td>
+     </tr>`
+  ).join('');
+  return `<table style="width:100%;border-collapse:collapse;font-size:.78rem;margin-top:6px">
+    <tr style="font-size:.62rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">
+      <th style="padding:3px 12px;text-align:right;font-weight:500">Jas</th>
+      <th style="padding:3px 12px;text-align:left;font-weight:500">Lux</th>
+    </tr>${rows}</table>`;
+}
+
+function renderCalibStatus(data) {
+  const el  = document.getElementById('calib-content');
+  const btn = document.getElementById('calib-btn');
+  if (!el || !data) return;
+
+  const { status, calibration } = data;
+
+  if (status.running) {
+    const pct = status.total > 0 ? Math.round(status.step / status.total * 100) : 0;
+    el.innerHTML = `
+      <div style="font-size:.82rem;color:var(--text-dim);margin-bottom:6px">
+        ⏳ Měřím… krok ${status.step} / ${status.total}
+        ${status.current_brightness !== null ? '(jas: <b>' + status.current_brightness + ' %</b>)' : ''}
+      </div>
+      <div style="background:rgba(255,255,255,.06);border-radius:4px;height:5px;overflow:hidden;margin-bottom:8px">
+        <div style="background:var(--accent);height:100%;width:${pct}%;transition:width .4s"></div>
+      </div>
+      ${renderCalibPoints(status.points)}`;
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Kalibrace probíhá…'; }
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = '📐 Spustit kalibraci'; }
+    let html = '';
+    if (status.error) {
+      html += `<div style="color:var(--red);font-size:.8rem;margin-bottom:8px">⚠ ${status.error}</div>`;
+    }
+    if (calibration?.points?.length) {
+      html += `<div style="font-size:.72rem;color:var(--text-muted);margin-bottom:4px">
+                 Provedena: ${calibration.timestamp || '—'}
+               </div>`;
+      html += renderCalibPoints(calibration.points);
+    } else if (!status.error) {
+      html = `<div style="font-size:.82rem;color:var(--text-muted);padding:10px 0">
+        Kalibrace dosud nebyla provedena.<br>
+        Spusťte ji pro okamžité nastavení jasu při změně cíle.
+      </div>`;
+    }
+    el.innerHTML = html;
+  }
+}
+
+async function fetchCalibStatus() {
+  try {
+    const r = await fetch('api/rl/calibration');
+    if (!r.ok) return;
+    const data = await r.json();
+    renderCalibStatus(data);
+
+    if (data.status?.running) {
+      if (!_calibPoll) _calibPoll = setInterval(fetchCalibStatus, 1500);
+    } else {
+      if (_calibPoll) { clearInterval(_calibPoll); _calibPoll = null; }
+      if (data.status?.timestamp) await refreshRLStats();
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function startCalibration() {
+  if (!confirm(
+    'Spustit kalibraci?\n\nŠvětla budou postupně přepínána na různé úrovně jasu.\n' +
+    'Doporučujeme provést v tmavé místnosti (nejlépe v noci).\nTrvá přibližně 30 sekund.'
+  )) return;
+  try {
+    const r = await fetch('api/rl/calibrate', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { showToast(d.error || 'Chyba při spuštění kalibrace', true); return; }
+    showToast('✔ Kalibrace spuštěna');
+    fetchCalibStatus();
+  } catch(e) { showToast('Chyba: ' + e.message, true); }
 }
 
 /* ═══════════════════════════════════════════
