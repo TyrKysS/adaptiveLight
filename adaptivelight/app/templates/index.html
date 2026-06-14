@@ -368,38 +368,50 @@ function drawCompass(az, elev) {
    OVERVIEW RENDERERS
 ═══════════════════════════════════════════ */
 function renderAutoCard(status, cfg) {
-  const enabled = cfg?.automation_enabled;
+  const enabled   = cfg?.automation_enabled;
   const threshold = cfg?.lux_threshold ?? 50;
-  const lights  = cfg?.selected_lights ?? [];
-  const sensors = cfg?.selected_lux_sensors ?? [];
-  const autoOff = cfg?.auto_turn_off ?? false;
+  const lights    = cfg?.selected_lights ?? [];
+  const sensors   = cfg?.selected_lux_sensors ?? [];
+  const autoOff   = cfg?.auto_turn_off ?? false;
+  const wsOk      = status?.ws_connected ?? false;
 
   let rule = '—';
   if (sensors.length && lights.length) {
     rule = `Lux < ${threshold} lx → zapnout ${lights.length} světl${lights.length===1?'o':'a'}` +
            (autoOff ? ` • Lux ≥ ${threshold} lx → zhasnout` : '');
-  } else if (!sensors.length || !lights.length) {
-    rule = 'Vyberte entity v záložce Nastavení';
+  } else {
+    rule = 'Vyberte entity v záložce ⚙️ Nastavení';
   }
 
-  const actionCls = status?.action==='turn_on' ? 'action-on' : status?.action==='turn_off' ? 'action-off' : '';
-  const actionLabel = {turn_on:'✔ Rozsvíceno',turn_off:'✔ Zhasnuto',null:'—'}[status?.action??null] ?? '—';
-  const luxLabel = status?.avg_lux != null ? `${status.avg_lux} lx (průměr)` : '—';
+  const actionCls   = status?.action==='turn_on' ? 'action-on' : status?.action==='turn_off' ? 'action-off' : '';
+  const actionLabel = {turn_on:'✔ Rozsvíceno', turn_off:'✔ Zhasnuto'}[status?.action] ?? '—';
+  const luxLabel    = status?.lux != null ? `${status.lux} lx` : '—';
+  const triggerTxt  = status?.trigger ? `spustil: ${status.trigger}` : '';
+
+  const wsChip = wsOk
+    ? `<div class="auto-chip" style="color:var(--green)">⚡ WebSocket připojen (real-time)</div>`
+    : `<div class="auto-chip" style="color:var(--red)">⚠ WebSocket odpojen${status?.error ? ': '+status.error : ''}</div>`;
 
   return `
     <div class="auto-card ${enabled?'enabled':''}">
-      <div class="auto-icon">${enabled?'⚡':'💤'}</div>
+      <div class="auto-icon">${enabled ? (wsOk?'⚡':'🔄') : '💤'}</div>
       <div class="auto-body">
-        <div class="auto-title">Automatizace <span style="font-size:.75rem;font-weight:400;color:${enabled?'#a855f7':'var(--text-muted)'}">● ${enabled?'Aktivní':'Vypnuto'}</span></div>
+        <div class="auto-title">
+          Automatizace
+          <span style="font-size:.75rem;font-weight:400;color:${enabled?'#a855f7':'var(--text-muted)'}">
+            ● ${enabled?'Aktivní':'Vypnuto'}
+          </span>
+        </div>
         <div class="auto-rule">${rule}</div>
         <div class="auto-meta">
+          ${wsChip}
           <div class="auto-chip ${actionCls}">Poslední akce: ${actionLabel}</div>
-          <div class="auto-chip">Průměrný lux: ${luxLabel}</div>
-          ${status?.error ? `<div class="auto-chip" style="color:var(--red)">⚠ ${status.error}</div>` : ''}
+          <div class="auto-chip">Lux při akci: ${luxLabel}</div>
+          ${triggerTxt ? `<div class="auto-chip" style="color:var(--text-muted);font-size:.65rem">${triggerTxt}</div>` : ''}
         </div>
       </div>
       <div class="auto-actions">
-        <button class="btn" onclick="triggerAuto()" title="Spustit nyní">▶ Spustit</button>
+        <button class="btn" onclick="triggerAuto()" title="Okamžité vyhodnocení pravidla přes REST">▶ Spustit</button>
       </div>
     </div>`;
 }

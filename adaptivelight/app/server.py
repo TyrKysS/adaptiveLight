@@ -1,16 +1,19 @@
+import asyncio
 import json
 import os
 import threading
 import time
 from datetime import datetime
 
+import aiohttp
 import requests
 from flask import Flask, jsonify, render_template
 from flask import request as freq
 
 app = Flask(__name__)
 
-HA_API = "http://supervisor/core/api"
+HA_API    = "http://supervisor/core/api"
+HA_WS_URL = "ws://supervisor/core/websocket"
 CONFIG_FILE = "/data/adaptivelight.json"
 
 DEFAULT_CONFIG = {
@@ -22,16 +25,45 @@ DEFAULT_CONFIG = {
     "auto_turn_off": False,
 }
 
-# ── HA helpers ────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
-def _headers():
-    token = os.environ.get("HA_TOKEN", "")
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+_cfg_cache: dict | None = None
+_cfg_cache_ts: float = 0.0
 
 
-def ha_get(path):
+def load_config() -> dict:
+    global _cfg_cache, _cfg_cache_ts
+    if _cfg_cache is None or (time.monotonic() - _cfg_cache_ts) > 5:
+        try:
+            with open(CONFIG_FILE) as f:
+                _cfg_cache = {**DEFAULT_CONFIG, **json.load(f)}
+        except Exception:
+            _cfg_cache = dict(DEFAULT_CONFIG)
+        _cfg_cache_ts = time.monotonic()
+    return _cfg_cache
+
+
+def save_config(cfg: dict) -> None:
+    global _cfg_cache, _cfg_cache_ts
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    _cfg_cache = dict(cfg)
+    _cfg_cache_ts = time.monotonic()
+
+
+# ── HA REST helpers (for UI data + manual trigger) ────────────────────────────
+
+def _rest_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {os.environ.get('HA_TOKEN', '')}",
+        "Content-Type": "application/json",
+    }
+
+
+def ha_get(path: str):
     try:
-        r = requests.get(f"{HA_API}{path}", headers=_headers(), timeout=10)
+        r = requests.get(f"{HA_API}{path}", headers=_rest_headers(), timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as exc:
@@ -39,9 +71,9 @@ def ha_get(path):
         return None
 
 
-def ha_post(path, data):
+def ha_post(path: str, data: dict) -> bool:
     try:
-        r = requests.post(f"{HA_API}{path}", headers=_headers(), json=data, timeout=10)
+        r = requests.post(f"{HA_API}{path}", headers=_rest_headers(), json=data, timeout=10)
         r.raise_for_status()
         return True
     except Exception as exc:
@@ -49,112 +81,195 @@ def ha_post(path, data):
         return False
 
 
-# ── Config persistence ────────────────────────────────────────────────────────
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
-        except Exception:
-            pass
-    return dict(DEFAULT_CONFIG)
-
-
-def save_config(cfg):
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-
-# ── Automation engine ─────────────────────────────────────────────────────────
+# ── Shared automation status ──────────────────────────────────────────────────
 
 _status_lock = threading.Lock()
-_auto_status = {
+_auto_status: dict = {
     "last_run": None,
     "action": None,
-    "avg_lux": None,
+    "lux": None,
     "threshold": None,
+    "trigger": None,
     "error": None,
+    "ws_connected": False,
 }
 
 
-def run_automation_once():
+def _set_status(**kw) -> None:
+    with _status_lock:
+        _auto_status.update(kw)
+
+
+def _now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+# ── Manual REST-based trigger ("Run now" button) ──────────────────────────────
+
+def run_automation_once() -> None:
     cfg = load_config()
-    if not cfg.get("automation_enabled"):
+    if not cfg["automation_enabled"]:
         return
 
-    lux_sensors = cfg.get("selected_lux_sensors", [])
-    lights = cfg.get("selected_lights", [])
-    threshold = float(cfg.get("lux_threshold", 50))
-    auto_turn_off = cfg.get("auto_turn_off", False)
+    sensors = cfg["selected_lux_sensors"]
+    lights  = cfg["selected_lights"]
+    thr     = float(cfg["lux_threshold"])
+    auto_off = cfg["auto_turn_off"]
 
-    if not lux_sensors or not lights:
-        with _status_lock:
-            _auto_status.update({"last_run": _now(), "action": None,
-                                  "avg_lux": None, "threshold": threshold,
-                                  "error": "Nejsou vybrány entity"})
+    if not sensors or not lights:
+        _set_status(last_run=_now(), error="Nejsou vybrány entity", action=None)
         return
 
     states = ha_get("/states")
     if states is None:
-        with _status_lock:
-            _auto_status["error"] = "Nelze načíst stavy z HA"
+        _set_status(error="Nelze načíst stavy z HA")
         return
 
-    state_map = {s["entity_id"]: s for s in states}
-
-    lux_values = []
-    for sid in lux_sensors:
-        if sid in state_map:
+    sm = {s["entity_id"]: s for s in states}
+    vals = []
+    for sid in sensors:
+        if sid in sm:
             try:
-                lux_values.append(float(state_map[sid]["state"]))
+                vals.append(float(sm[sid]["state"]))
             except (ValueError, TypeError):
                 pass
 
-    if not lux_values:
-        with _status_lock:
-            _auto_status.update({"last_run": _now(), "action": None,
-                                  "avg_lux": None, "threshold": threshold,
-                                  "error": "Lux senzory nemají platné hodnoty"})
+    if not vals:
+        _set_status(last_run=_now(), error="Lux senzory nemají platné hodnoty", action=None)
         return
 
-    avg_lux = sum(lux_values) / len(lux_values)
+    avg = sum(vals) / len(vals)
     action = None
-
-    if avg_lux < threshold:
+    if avg < thr:
         for lid in lights:
             ha_post("/services/light/turn_on", {"entity_id": lid})
         action = "turn_on"
-    elif auto_turn_off:
+    elif auto_off:
         for lid in lights:
             ha_post("/services/light/turn_off", {"entity_id": lid})
         action = "turn_off"
 
-    with _status_lock:
-        _auto_status.update({
-            "last_run": _now(),
-            "action": action,
-            "avg_lux": round(avg_lux, 1),
-            "threshold": threshold,
-            "error": None,
-        })
+    _set_status(last_run=_now(), action=action, lux=round(avg, 1),
+                threshold=thr, error=None, trigger="manuální spuštění")
 
 
-def _now():
-    return datetime.utcnow().isoformat() + "Z"
+# ── WebSocket automation (real-time, event-driven) ────────────────────────────
+
+async def _apply_rule(ws, entity_id: str, lux_val: float, mid: list) -> None:
+    cfg = load_config()
+    if not cfg["automation_enabled"]:
+        return
+
+    lights   = cfg["selected_lights"]
+    thr      = float(cfg["lux_threshold"])
+    auto_off = cfg["auto_turn_off"]
+
+    if not lights:
+        return
+
+    if lux_val < thr:
+        for lid in lights:
+            mid[0] += 1
+            await ws.send_json({
+                "id": mid[0], "type": "call_service",
+                "domain": "light", "service": "turn_on",
+                "service_data": {"entity_id": lid},
+            })
+        _set_status(last_run=_now(), action="turn_on", lux=round(lux_val, 1),
+                    threshold=thr, error=None, trigger=entity_id)
+
+    elif auto_off:
+        for lid in lights:
+            mid[0] += 1
+            await ws.send_json({
+                "id": mid[0], "type": "call_service",
+                "domain": "light", "service": "turn_off",
+                "service_data": {"entity_id": lid},
+            })
+        _set_status(last_run=_now(), action="turn_off", lux=round(lux_val, 1),
+                    threshold=thr, error=None, trigger=entity_id)
 
 
-def _automation_loop():
+async def _ws_session() -> None:
+    token = os.environ.get("HA_TOKEN", "")
+    mid = [0]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(HA_WS_URL) as ws:
+
+            # ── auth handshake ─────────────────────────────────────────────
+            msg = await ws.receive_json()
+            if msg.get("type") != "auth_required":
+                raise RuntimeError(f"Unexpected WS message: {msg}")
+
+            await ws.send_json({"type": "auth", "access_token": token})
+            msg = await ws.receive_json()
+            if msg.get("type") != "auth_ok":
+                raise RuntimeError(f"WS auth failed: {msg}")
+
+            # ── subscribe to state_changed ─────────────────────────────────
+            mid[0] += 1
+            await ws.send_json({
+                "id": mid[0],
+                "type": "subscribe_events",
+                "event_type": "state_changed",
+            })
+            msg = await ws.receive_json()
+            if not msg.get("success"):
+                raise RuntimeError(f"Subscribe failed: {msg}")
+
+            app.logger.info("WS: connected and listening for state_changed")
+            _set_status(ws_connected=True, error=None)
+
+            # ── event loop ─────────────────────────────────────────────────
+            async for raw in ws:
+                if raw.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(raw.data)
+
+                    if data.get("type") != "event":
+                        continue
+
+                    event = data.get("event", {})
+                    if event.get("event_type") != "state_changed":
+                        continue
+
+                    new_state = event.get("data", {}).get("new_state")
+                    if not new_state:
+                        continue
+
+                    eid = new_state.get("entity_id", "")
+
+                    if eid not in load_config().get("selected_lux_sensors", []):
+                        continue
+
+                    try:
+                        lux_val = float(new_state["state"])
+                    except (ValueError, TypeError):
+                        continue
+
+                    await _apply_rule(ws, eid, lux_val, mid)
+
+                elif raw.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                    raise RuntimeError(f"WS closed ({raw.type})")
+
+
+async def _ws_loop() -> None:
     while True:
         try:
-            run_automation_once()
+            await _ws_session()
         except Exception as exc:
-            app.logger.error("Automation loop error: %s", exc)
-        time.sleep(30)
+            app.logger.warning("WS: %s — reconnect in 10 s", exc)
+            _set_status(ws_connected=False, error=f"WS přerušeno: {exc}")
+        await asyncio.sleep(10)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+def _start_ws_thread() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_ws_loop())
+
+
+# ── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -170,15 +285,15 @@ def entities():
     lights, motion, lux = [], [], []
 
     for s in states:
-        eid = s["entity_id"]
+        eid  = s["entity_id"]
         attr = s["attributes"]
         name = attr.get("friendly_name", eid)
 
         if eid.startswith("light."):
-            brightness = attr.get("brightness")
+            br = attr.get("brightness")
             lights.append({
                 "entity_id": eid, "state": s["state"], "friendly_name": name,
-                "brightness_pct": round(brightness / 2.55) if brightness is not None else None,
+                "brightness_pct": round(br / 2.55) if br is not None else None,
                 "rgb_color": attr.get("rgb_color"),
                 "last_changed": s.get("last_changed", ""),
             })
@@ -200,12 +315,12 @@ def entities():
                 "last_changed": s.get("last_changed", ""),
             })
 
-    sun_entity = next((s for s in states if s["entity_id"] == "sun.sun"), None)
+    sun_ent = next((s for s in states if s["entity_id"] == "sun.sun"), None)
     sun = None
-    if sun_entity:
-        a = sun_entity["attributes"]
+    if sun_ent:
+        a = sun_ent["attributes"]
         sun = {
-            "state": sun_entity["state"],
+            "state": sun_ent["state"],
             "elevation": a.get("elevation"), "azimuth": a.get("azimuth"),
             "rising": a.get("rising"),
             "next_dawn": a.get("next_dawn", ""), "next_dusk": a.get("next_dusk", ""),
@@ -235,12 +350,10 @@ def post_config():
     if not body:
         return jsonify({"error": "Chybí JSON tělo"}), 400
     cfg = load_config()
-    allowed = set(DEFAULT_CONFIG.keys())
     for k, v in body.items():
-        if k in allowed:
+        if k in DEFAULT_CONFIG:
             cfg[k] = v
     save_config(cfg)
-    # Immediately apply automation after save
     threading.Thread(target=run_automation_once, daemon=True).start()
     return jsonify({"ok": True})
 
@@ -258,9 +371,9 @@ def automation_run():
     return jsonify({"ok": True})
 
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+# ── Boot ──────────────────────────────────────────────────────────────────────
 
-threading.Thread(target=_automation_loop, daemon=True).start()
+threading.Thread(target=_start_ws_thread, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("INGRESS_PORT", 8099))
