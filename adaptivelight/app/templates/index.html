@@ -941,10 +941,10 @@ async function saveRL() {
 async function refreshRLStats() {
   try {
     const r = await fetch('api/rl/status');
-    if (r.ok) {
-      _rlStatus = await r.json();
-      const el = document.getElementById('rlRoot');
-      if (el) renderRL();
+    if (!r.ok) return;
+    _rlStatus = await r.json();
+    if (document.getElementById('tab-rl')?.classList.contains('active')) {
+      renderRL();
     }
   } catch(e) { /* ignore */ }
 }
@@ -967,11 +967,13 @@ async function resetRLModel() {
 /* ═══════════════════════════════════════════
    AUTO-REFRESH (overview only)
 ═══════════════════════════════════════════ */
-let cd = 30;
+let cd = 30, rlCd = 10;
 function tick() {
   cd--;
+  rlCd--;
   document.getElementById('countdown').textContent = `Auto-refresh: ${cd}s`;
-  if (cd<=0) { cd=30; refreshOverview(); }
+  if (cd <= 0)  { cd = 30;  refreshOverview(); }
+  if (rlCd <= 0){ rlCd = 10; refreshRLStats(); }
 }
 refreshOverview();
 setInterval(tick, 1000);
