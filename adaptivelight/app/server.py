@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
     "rl_target_lux": 100,
     "rl_input_sensors": [],
     "rl_output_lights": [],
+    "rl_night_only": False,
+    "rl_sun_threshold": 0.0,   # degrees; RL runs only when sun elevation < this
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -114,6 +116,7 @@ _rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
 _rl_last_action_ts: float = 0.0
 _rl_action_cooldown: float = 20.0  # seconds between RL actions
 _rl_lock = threading.Lock()
+_sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
 
 
 def _get_rl_agent() -> RLAgent:
@@ -121,6 +124,18 @@ def _get_rl_agent() -> RLAgent:
     if _rl_agent is None:
         _rl_agent = RLAgent()
     return _rl_agent
+
+
+def _init_sun_elevation() -> None:
+    global _sun_elevation
+    time.sleep(5)  # wait for HA to be ready
+    state = ha_get("/states/sun.sun")
+    if state:
+        try:
+            _sun_elevation = float(state.get("attributes", {}).get("elevation", 90.0))
+            app.logger.info("Sun elevation initialized: %.1f°", _sun_elevation)
+        except (ValueError, TypeError):
+            pass
 
 
 def _now() -> str:
@@ -227,6 +242,10 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     if now - _rl_last_action_ts < _rl_action_cooldown:
         return
 
+    if cfg.get("rl_night_only", False):
+        if _sun_elevation > float(cfg.get("rl_sun_threshold", 0.0)):
+            return
+
     agent = _get_rl_agent()
     with _rl_lock:
         cur_br = _rl_brightness
@@ -314,6 +333,18 @@ async def _ws_session() -> None:
                         continue
 
                     eid = new_state.get("entity_id", "")
+
+                    # Track sun elevation (used by night-only RL mode)
+                    if eid == "sun.sun":
+                        global _sun_elevation
+                        try:
+                            _sun_elevation = float(
+                                new_state.get("attributes", {}).get("elevation", _sun_elevation)
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        continue
+
                     cfg = load_config()
 
                     # RL path takes priority when enabled
@@ -461,8 +492,10 @@ def automation_run():
 
 @app.route("/api/rl/status")
 def rl_status():
-    cfg   = load_config()
-    agent = _get_rl_agent()
+    cfg      = load_config()
+    agent    = _get_rl_agent()
+    night    = cfg.get("rl_night_only", False)
+    sun_thr  = float(cfg.get("rl_sun_threshold", 0.0))
     with _rl_lock:
         br = _rl_brightness
     return jsonify({
@@ -470,6 +503,8 @@ def rl_status():
         "enabled":            cfg.get("rl_enabled", False),
         "target_lux":         cfg.get("rl_target_lux", 100),
         "current_brightness": round(br, 1),
+        "sun_elevation":      round(_sun_elevation, 1),
+        "blocked_by_sun":     night and (_sun_elevation > sun_thr),
     })
 
 
@@ -486,6 +521,7 @@ def rl_reset():
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
 threading.Thread(target=_start_ws_thread, daemon=True).start()
+threading.Thread(target=_init_sun_elevation, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("INGRESS_PORT", 8099))

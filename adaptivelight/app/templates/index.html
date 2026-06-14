@@ -790,8 +790,14 @@ function rlStatsHtml(rl) {
   const br     = rl.current_brightness != null ? rl.current_brightness.toFixed(0) + ' %' : '—';
   const delta  = rl.last_delta != null ? (rl.last_delta > 0 ? '+' : '') + rl.last_delta + ' %' : '—';
   const reward = rl.last_reward != null ? rl.last_reward.toFixed(3) : '—';
+  const elev   = rl.sun_elevation != null ? rl.sun_elevation.toFixed(1) + '°' : '—';
   const dColor = rl.last_delta > 0 ? 'var(--green)' : rl.last_delta < 0 ? 'var(--blue)' : 'var(--text-dim)';
   const rColor = rl.last_reward > 0 ? 'var(--green)' : rl.last_reward < 0 ? 'var(--red)' : 'var(--text-muted)';
+  const eColor = rl.sun_elevation != null ? (rl.sun_elevation > 0 ? 'var(--accent)' : 'var(--blue)') : 'var(--text-muted)';
+  const blocked = rl.blocked_by_sun
+    ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:var(--r-sm);font-size:.78rem;color:var(--accent)">
+         ☀️ RL je blokováno — slunce je ještě nad nastaveným prahem
+       </div>` : '';
   return `
     <div class="rl-stats-grid">
       <div class="rl-stat"><div class="rl-stat-lbl">Kroky tréninku</div><div class="rl-stat-val">${steps}</div></div>
@@ -800,7 +806,9 @@ function rlStatsHtml(rl) {
       <div class="rl-stat"><div class="rl-stat-lbl">Aktuální jas</div><div class="rl-stat-val" style="color:var(--accent)">${br}</div></div>
       <div class="rl-stat"><div class="rl-stat-lbl">Poslední krok</div><div class="rl-stat-val" style="color:${dColor}">${delta}</div></div>
       <div class="rl-stat"><div class="rl-stat-lbl">Odměna</div><div class="rl-stat-val" style="color:${rColor}">${reward}</div></div>
-    </div>`;
+      <div class="rl-stat"><div class="rl-stat-lbl">Elevace slunce</div><div class="rl-stat-val" style="color:${eColor}">${elev}</div></div>
+    </div>
+    ${blocked}`;
 }
 
 async function loadRL() {
@@ -846,6 +854,26 @@ function renderRL() {
             <input type="checkbox" ${c.rl_enabled?'checked':''} onchange="cfgSet('rl_enabled',this.checked)">
             <span class="slider"></span>
           </label>
+        </div>
+
+        <div class="toggle-row" style="margin-top:16px">
+          <div>
+            <div class="toggle-label">Aktivní pouze v noci</div>
+            <div class="toggle-desc">RL bude konat akce jen při nízké elevaci slunce</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="rl-night-only" ${c.rl_night_only?'checked':''}
+              onchange="cfgSet('rl_night_only',this.checked);document.getElementById('rl-sun-row').style.display=this.checked?'flex':'none'">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div id="rl-sun-row" style="display:${c.rl_night_only?'flex':'none'};align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap">
+          <span style="font-size:.82rem;color:var(--text-dim)">Elevace ≤</span>
+          <input type="number" class="lux-number" style="width:84px" min="-18" max="20" step="1"
+            value="${c.rl_sun_threshold}"
+            oninput="cfgSet('rl_sun_threshold',+this.value)">
+          <span class="lux-unit">°</span>
+          <span style="font-size:.72rem;color:var(--text-muted)">0° = po západu · −6° = soumrak · −12° = tma</span>
         </div>
 
         <div style="margin-top:18px">
