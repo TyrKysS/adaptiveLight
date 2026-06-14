@@ -114,7 +114,7 @@ def _set_status(**kw) -> None:
 _rl_agent: "RLAgent | None" = None
 _rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
 _rl_last_action_ts: float = 0.0
-_rl_action_cooldown: float = 20.0  # seconds between RL actions
+_rl_action_cooldown: float = 10.0  # seconds between RL actions
 _rl_lock = threading.Lock()
 _sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
 

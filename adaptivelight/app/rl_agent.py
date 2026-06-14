@@ -88,9 +88,9 @@ class RLAgent:
         self.epsilon_decay: float = 0.99
         self.gamma:         float = 0.95
         self.lr:            float = 5e-4
-        self.batch:         int   = 32
+        self.batch:         int   = 8
         self.steps:         int   = 0
-        self.target_freq:   int   = 100
+        self.target_freq:   int   = 50
 
         # per-step tracking (updated by server.py)
         self.prev_state:      "np.ndarray | None" = None
