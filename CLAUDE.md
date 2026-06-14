@@ -11,11 +11,32 @@ A Home Assistant add-on that displays a dashboard of lighting-relevant entities 
 The add-on is a single Python/Flask app with no database and no build step.
 
 - **`adaptivelight/app/server.py`** — Flask backend. Calls the HA Supervisor REST API (`http://supervisor/core/api`) for entity states and uses a persistent WebSocket connection (`ws://supervisor/core/websocket`) in a background thread for real-time lux automation. Config is stored in `/data/adaptivelight.json` (inside the container).
-- **`adaptivelight/app/templates/index.html`** — Entire frontend: HTML + CSS + vanilla JS in one file. Polls `/api/entities` every 30 s. Has tabs for Sun, Lights, Motion, Lux, and an Automation settings panel.
+- **`adaptivelight/app/templates/index.html`** — Entire frontend: HTML + CSS + vanilla JS in one file. Polls `/api/entities` every 30 s, RL stats every 10 s. Tabs: Přehled, Nastavení, RL Regulace.
+- **`adaptivelight/app/rl_agent.py`** — Self-contained RL module (no ML framework). See section below.
 - **`adaptivelight/run.sh`** — Container entrypoint (bashio). Sets `HA_TOKEN` from `$SUPERVISOR_TOKEN`, then starts `server.py`.
 - **`adaptivelight/config.yaml`** — Add-on manifest. Declares ingress on port 8099, requires both `hassio_api` and `homeassistant_api`.
 - **`adaptivelight/build.yaml`** — Multi-arch base images (Python 3.11 / Alpine 3.18).
 - **`repository.yaml`** — Marks this repo as an HA add-on repository.
+
+## RL architecture (`rl_agent.py`)
+
+Closed-loop brightness regulation via Q-learning. Triggered on every lux `state_changed` WebSocket event.
+
+**Neural network:** 4 → 32 → 16 → 11 (ReLU hidden, linear output, He init, manual SGD backprop — pure numpy, no framework).
+
+**State vector:** `[lux_error_norm, brightness_norm, lux_trend_norm, prev_action_norm]`
+- `lux_error_norm` = `(current_lux − target_lux) / target_lux`, clipped to [−3, 3]
+- `brightness_norm` = current RL-tracked brightness / 100
+- `lux_trend_norm` = change since last reading / target_lux, clipped to [−1, 1]
+- `prev_action_norm` = last brightness delta / 25
+
+**Actions (11 discrete):** brightness delta in % — `[−25, −15, −10, −5, −2, 0, +2, +5, +10, +15, +25]`
+
+**Reward:** `−|error_pct| × 2`, bonus `+2.0` at <5 % error, `+0.5` at <15 %, `+0.4` if improving vs. previous step.
+
+**Training:** experience replay (buffer 4 000, batch 32), target network synced every 100 steps, ε-greedy (0.60 → 0.05 decay × 0.99/step), model auto-saved to `/data/rl_model.json` every 50 steps.
+
+**Threading:** `RLAgent` is a singleton (`_get_rl_agent()`). Its internal `_lock` guards network weights. Brightness is tracked in module-level `_rl_brightness` guarded by `_rl_lock`. The RL path in the WS event loop takes priority over the threshold path — a sensor in `rl_input_sensors` is never passed to `_apply_rule`.
 
 ## API surface (`server.py`)
 
@@ -23,9 +44,11 @@ The add-on is a single Python/Flask app with no database and no build step.
 |---|---|---|
 | `/` | GET | Serves `index.html` |
 | `/api/entities` | GET | Returns lights, motion sensors, lux sensors, sun state |
-| `/api/config` | GET/POST | Read/write `/data/adaptivelight.json`; POST also triggers automation once |
+| `/api/config` | GET/POST | Read/write `/data/adaptivelight.json`; POST also triggers threshold automation once |
 | `/api/automation/status` | GET | Returns last automation run info + WS connection state |
-| `/api/automation/run` | POST | Manually triggers automation once (REST-based) |
+| `/api/automation/run` | POST | Manually triggers threshold automation once (REST-based) |
+| `/api/rl/status` | GET | Returns RL agent info (epsilon, steps, memory, last delta/reward) + current brightness |
+| `/api/rl/reset` | POST | Resets model weights, clears replay buffer, deletes `/data/rl_model.json` |
 
 ## Local development
 
