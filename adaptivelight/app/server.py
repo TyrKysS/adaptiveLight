@@ -7,16 +7,19 @@ from flask import Flask, jsonify, render_template
 app = Flask(__name__)
 
 HA_API = "http://supervisor/core/api"
-_token = os.environ.get("SUPERVISOR_TOKEN", "")
-HEADERS = {
-    "Authorization": f"Bearer {_token}",
-    "Content-Type": "application/json",
-}
+
+
+def _headers():
+    token = os.environ.get("HA_TOKEN", "")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
 
 def ha_get(path):
     try:
-        resp = requests.get(f"{HA_API}{path}", headers=HEADERS, timeout=10)
+        resp = requests.get(f"{HA_API}{path}", headers=_headers(), timeout=10)
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
