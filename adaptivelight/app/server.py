@@ -34,7 +34,8 @@ DEFAULT_CONFIG = {
     "rl_output_lights": [],
     "rl_night_only": False,
     "rl_sun_threshold": 0.0,   # degrees; RL runs only when sun elevation < this
-    "rl_action_cooldown": 3.0, # seconds between successive RL brightness adjustments
+    "rl_action_cooldown":  3.0, # seconds between successive RL brightness adjustments
+    "rl_lux_tolerance":    0.5, # dead band ± lux around target; no command issued inside
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -351,7 +352,9 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         if _calib_status["running"]:
             return
 
-    agent = _get_rl_agent()
+    agent     = _get_rl_agent()
+    tolerance = float(cfg.get("rl_lux_tolerance", 0.5))
+    in_band   = abs(lux_val - target) <= tolerance
 
     # Warm start: on first action use calibration curve instead of 50 % default
     calib = load_calibration()
@@ -369,15 +372,30 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
                                 agent.prev_lux, agent.prev_action_idx)
 
     if agent.prev_state is not None:
-        reward            = RLAgent.compute_reward(lux_val, target, agent.prev_lux)
+        reward            = RLAgent.compute_reward(lux_val, target, agent.prev_lux, tolerance)
         agent.last_reward = reward
         agent.remember(agent.prev_state, agent.prev_action_idx, reward, state)
         agent.replay()
 
     action_idx = agent.act(state)
     delta      = ACTIONS[action_idx]
+
+    # Always update state tracking and cooldown
+    agent.prev_state      = state
+    agent.prev_action_idx = action_idx
+    agent.prev_lux        = lux_val
+    _rl_last_action_ts    = now
+
+    # Inside dead band: skip brightness command, RL only learns
+    if in_band:
+        agent.last_delta = 0
+        _set_status(last_run=_now(), action="rl_in_band",
+                    lux=round(lux_val, 1), threshold=target,
+                    trigger=entity_id, error=None)
+        return
+
     with _rl_lock:
-        new_br        = float(np.clip(_rl_brightness + delta, 5, 100))
+        new_br         = float(np.clip(_rl_brightness + delta, 5, 100))
         _rl_brightness = new_br
     brightness_255 = int(new_br / 100 * 255)
 
@@ -389,12 +407,7 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
             "service_data": {"entity_id": lid, "brightness": brightness_255},
         })
 
-    agent.prev_state      = state
-    agent.prev_action_idx = action_idx
-    agent.prev_lux        = lux_val
-    agent.last_delta      = delta
-    _rl_last_action_ts    = now
-
+    agent.last_delta = delta
     _set_status(last_run=_now(), action=f"rl_br_{int(new_br)}",
                 lux=round(lux_val, 1), threshold=target,
                 trigger=entity_id, error=None)

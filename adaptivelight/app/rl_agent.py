@@ -117,15 +117,17 @@ class RLAgent:
 
     @staticmethod
     def compute_reward(current_lux: float, target_lux: float,
-                       prev_lux: "float | None") -> float:
+                       prev_lux: "float | None", tolerance: float = 0.5) -> float:
         t   = max(target_lux, 1.0)
-        pct = abs(current_lux - t) / t
+        err = abs(current_lux - t)
+        # Dead band: within ±tolerance lux is considered "at target"
+        if err <= tolerance:
+            return 2.0
+        pct = err / t
         r   = -pct * 2.0
-        if pct < 0.05:
-            r += 2.0
-        elif pct < 0.15:
+        if pct < 0.15:
             r += 0.5
-        if prev_lux is not None and abs(current_lux - t) < abs(prev_lux - t):
+        if prev_lux is not None and err < abs(prev_lux - t):
             r += 0.4
         return float(np.clip(r, -3.0, 3.0))
 

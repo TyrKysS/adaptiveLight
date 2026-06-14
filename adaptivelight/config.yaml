@@ -1,6 +1,6 @@
 name: "AdaptiveLight Monitor"
 description: "Dashboard pro přehled světelných entit, pohybových čidel, lux senzorů a dat slunce v Home Assistant."
-version: "1.5.0"
+version: "1.5.1"
 slug: "adaptivelight"
 init: false
 arch:
