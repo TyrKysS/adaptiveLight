@@ -111,6 +111,8 @@ def _set_status(**kw) -> None:
 
 _rl_agent: "RLAgent | None" = None
 _rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
+_rl_last_action_ts: float = 0.0
+_rl_action_cooldown: float = 20.0  # seconds between RL actions
 _rl_lock = threading.Lock()
 
 
@@ -213,12 +215,16 @@ async def _apply_rule(ws, entity_id: str, lux_val: float, mid: list) -> None:
 
 async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     """RL brightness regulation — called from WebSocket event loop."""
-    global _rl_brightness
+    global _rl_brightness, _rl_last_action_ts
     cfg    = load_config()
     lights = cfg.get("rl_output_lights", [])
     target = float(cfg.get("rl_target_lux", 100))
 
     if not lights:
+        return
+
+    now = time.monotonic()
+    if now - _rl_last_action_ts < _rl_action_cooldown:
         return
 
     agent = _get_rl_agent()
@@ -253,6 +259,7 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     agent.prev_action_idx = action_idx
     agent.prev_lux        = lux_val
     agent.last_delta      = delta
+    _rl_last_action_ts    = now
 
     _set_status(last_run=_now(), action=f"rl_br_{int(new_br)}",
                 lux=round(lux_val, 1), threshold=target,
