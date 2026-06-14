@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AdaptiveLight Monitor</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d1117;
+      --bg-card:     #161b22;
+      --bg-inset:    #0d1117;
+      --border:      rgba(255,255,255,0.07);
+      --accent:      #f59e0b;
+      --blue:        #3b82f6;
+      --green:       #22c55e;
+      --red:         #ef4444;
+      --text:        #e2e8f0;
+      --text-muted:  #64748b;
+      --text-dim:    #94a3b8;
+      --radius:      12px;
+      --radius-sm:   8px;
+      --shadow:      0 4px 24px rgba(0,0,0,.5);
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+      min-height: 100vh;
+      padding: 20px 16px 40px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── HEADER ─────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 24px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -.3px;
+    }
+    .header-sub {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .header-actions { display: flex; align-items: center; gap: 10px; }
+    .btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 14px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 0.8rem;
+      font-weight: 500;
+      transition: background .15s, border-color .15s;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .btn:hover { background: #1e2430; border-color: rgba(255,255,255,.15); }
+    .countdown {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      min-width: 80px;
+      text-align: right;
+    }
+
+    /* ── STAT BAR ───────────────────────────────── */
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 10px;
+      margin-bottom: 22px;
+    }
+    .stat {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      text-align: center;
+    }
+    .stat-num {
+      font-size: 1.9rem;
+      font-weight: 700;
+      color: var(--accent);
+      line-height: 1;
+    }
+    .stat-lbl {
+      margin-top: 5px;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+
+    /* ── SUN CARD ────────────────────────────────── */
+    .sun-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      margin-bottom: 22px;
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      flex-wrap: wrap;
+    }
+    canvas#sunCompass {
+      width: 160px; height: 160px;
+      flex-shrink: 0;
+      border-radius: 50%;
+    }
+    .sun-meta { flex: 1; min-width: 240px; }
+    .sun-status {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 14px;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+    }
+    .sun-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 10px;
+    }
+    .sun-metric {
+      background: var(--bg-inset);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+    }
+    .sun-metric-lbl {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 4px;
+    }
+    .sun-metric-val {
+      font-size: 1.25rem;
+      font-weight: 700;
+    }
+    .val-elevation { color: #f97316; }
+    .val-azimuth   { color: var(--blue); }
+    .val-time      { font-size: 1rem; color: var(--text-dim); }
+
+    /* ── SECTION ─────────────────────────────────── */
+    .section { margin-bottom: 22px; }
+    .section-hdr {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 10px;
+    }
+    .section-title { font-size: 0.95rem; font-weight: 600; }
+    .badge {
+      background: rgba(255,255,255,.08);
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+    }
+
+    /* ── ENTITY GRID ─────────────────────────────── */
+    .entity-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+      gap: 8px;
+    }
+    .entity {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 11px 14px;
+      display: flex; align-items: center; gap: 10px;
+      transition: background .12s;
+    }
+    .entity:hover { background: #1b2130; }
+
+    .dot {
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot-on   { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .dot-off  { background: #374151; }
+    .dot-na   { background: var(--red); }
+    .dot-lux  { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+
+    .entity-info { flex: 1; min-width: 0; }
+    .entity-name {
+      font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .entity-eid {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+
+    .bar-wrap {
+      margin-top: 5px;
+      height: 3px;
+      background: rgba(255,255,255,.06);
+      border-radius: 2px; overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width .3s;
+    }
+    .bar-light { background: var(--accent); }
+    .bar-lux   { background: #f59e0b; }
+
+    .entity-val {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .entity-val.on { color: var(--green); }
+    .entity-val.lux { color: #f59e0b; }
+
+    /* ── EMPTY / ERROR ───────────────────────────── */
+    .empty {
+      text-align: center;
+      padding: 28px 16px;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      background: var(--bg-card);
+      border-radius: var(--radius-sm);
+      border: 1px dashed var(--border);
+    }
+    .error-box {
+      background: rgba(239,68,68,.08);
+      border: 1px solid rgba(239,68,68,.25);
+      border-radius: var(--radius);
+      padding: 18px;
+      color: #fca5a5;
+      text-align: center;
+    }
+    .loading {
+      text-align: center;
+      padding: 70px 20px;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    /* ── SPIN ────────────────────────────────────── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { display: inline-block; animation: spin .8s linear infinite; }
+
+    @media (max-width: 540px) {
+      .sun-card { flex-direction: column; align-items: stretch; }
+      canvas#sunCompass { margin: 0 auto; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>☀️ AdaptiveLight Monitor</h1>
+    <div class="header-sub" id="lastUpdated">Inicializuji…</div>
+  </div>
+  <div class="header-actions">
+    <div class="countdown" id="countdown"></div>
+    <button class="btn" onclick="refresh()">
+      <span id="refreshIcon">↻</span> Obnovit
+    </button>
+  </div>
+</div>
+
+<div id="root"><div class="loading">⏳ Načítám entity z Home Assistant…</div></div>
+
+<script>
+/* ── Helpers ─────────────────────────────────────── */
+const fmt = {
+  state(s) {
+    return {on:'ZAP',off:'VYP',unavailable:'N/A',unknown:'???',
+            above_horizon:'Nad horizontem',below_horizon:'Pod horizontem'}[s] ?? s;
+  },
+  time(iso) {
+    if (!iso) return '—';
+    try { return new Date(iso).toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'}); }
+    catch { return iso; }
+  },
+  num(v) {
+    const n = parseFloat(v);
+    return isNaN(n) ? v : n.toLocaleString('cs-CZ',{maximumFractionDigits:1});
+  }
+};
+
+function dotClass(state) {
+  if (state === 'on' || state === 'above_horizon') return 'dot-on';
+  if (state === 'unavailable') return 'dot-na';
+  return 'dot-off';
+}
+
+/* ── Sun compass (canvas) ────────────────────────── */
+function drawCompass(az, elev) {
+  const c = document.getElementById('sunCompass');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = c.width, cx = W/2, cy = W/2, R = cx - 4;
+
+  ctx.clearRect(0, 0, W, W);
+
+  // outer ring
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,Math.PI*2);
+  ctx.fillStyle = '#0d1117'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.1)'; ctx.lineWidth = 1; ctx.stroke();
+
+  // inner rings
+  [0.66, 0.33].forEach(f => {
+    ctx.beginPath(); ctx.arc(cx,cy,R*f,0,Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.stroke();
+  });
+
+  // cardinal labels
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  [['S',0],['V',90],['J',180],['Z',270]].forEach(([lbl,deg]) => {
+    const a = (deg-90)*Math.PI/180;
+    ctx.fillStyle = deg===0||deg===180 ? 'rgba(255,255,255,.5)' : 'rgba(255,255,255,.3)';
+    ctx.fillText(lbl, cx + (R-11)*Math.cos(a), cy + (R-11)*Math.sin(a));
+  });
+
+  if (az == null) return;
+
+  // elevation ratio: map [-18..90] → [1..0] (distance from center)
+  const elRatio = Math.min(1, Math.max(0, (Number(elev)+18)/108));
+  const dist = R * (1 - elRatio * 0.8);
+  const azRad = (Number(az)-90)*Math.PI/180;
+  const sx = cx + dist*Math.cos(azRad);
+  const sy = cy + dist*Math.sin(azRad);
+
+  // line from center
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(sx, sy);
+  ctx.strokeStyle = 'rgba(251,191,36,.2)'; ctx.lineWidth = 1; ctx.stroke();
+
+  // glow
+  const g = ctx.createRadialGradient(sx,sy,0,sx,sy,16);
+  g.addColorStop(0,'rgba(251,191,36,.7)'); g.addColorStop(1,'rgba(251,191,36,0)');
+  ctx.beginPath(); ctx.arc(sx,sy,16,0,Math.PI*2);
+  ctx.fillStyle = g; ctx.fill();
+
+  // sun dot
+  ctx.beginPath(); ctx.arc(sx,sy,6,0,Math.PI*2);
+  ctx.fillStyle = '#fbbf24'; ctx.fill();
+}
+
+/* ── Renderers ───────────────────────────────────── */
+function renderSun(sun) {
+  if (!sun) return '<div class="error-box">Entita <code>sun.sun</code> nebyla nalezena v Home Assistant.</div>';
+
+  const isUp = sun.state === 'above_horizon';
+  const elev = sun.elevation != null ? Number(sun.elevation).toFixed(1)+'°' : '—';
+  const azim = sun.azimuth  != null ? Number(sun.azimuth ).toFixed(1)+'°' : '—';
+
+  return `
+    <div class="sun-card">
+      <canvas id="sunCompass" width="160" height="160"></canvas>
+      <div class="sun-meta">
+        <div class="sun-status">
+          <span class="dot ${isUp?'dot-on':'dot-off'}"></span>
+          <span>${fmt.state(sun.state)}</span>
+          <span style="color:var(--text-muted)">&bull; ${sun.rising ? '↑ Vychází' : '↓ Zapadá'}</span>
+        </div>
+        <div class="sun-grid">
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Elevace</div>
+            <div class="sun-metric-val val-elevation">${elev}</div>
+          </div>
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Azimut</div>
+            <div class="sun-metric-val val-azimuth">${azim}</div>
+          </div>
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Příští východ</div>
+            <div class="sun-metric-val val-time">${fmt.time(sun.next_rising)}</div>
+          </div>
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Příští západ</div>
+            <div class="sun-metric-val val-time">${fmt.time(sun.next_setting)}</div>
+          </div>
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Solární poledne</div>
+            <div class="sun-metric-val val-time">${fmt.time(sun.next_noon)}</div>
+          </div>
+          <div class="sun-metric">
+            <div class="sun-metric-lbl">Svítání</div>
+            <div class="sun-metric-val val-time">${fmt.time(sun.next_dawn)}</div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderLights(lights) {
+  if (!lights.length) return '<div class="empty">Žádná světelná entita nebyla nalezena</div>';
+  return lights.map(l => {
+    const isOn = l.state === 'on';
+    const rgb  = l.rgb_color ? `rgb(${l.rgb_color.join(',')})` : null;
+    const dotStyle = isOn && rgb
+      ? `style="background:${rgb};box-shadow:0 0 6px ${rgb}"`
+      : '';
+    const bar = isOn && l.brightness_pct != null
+      ? `<div class="bar-wrap"><div class="bar-fill bar-light" style="width:${l.brightness_pct}%"></div></div>`
+      : '';
+    const val = isOn ? (l.brightness_pct != null ? l.brightness_pct+'%' : 'ZAP') : fmt.state(l.state);
+    return `
+      <div class="entity">
+        <span class="dot ${dotClass(l.state)}" ${dotStyle}></span>
+        <div class="entity-info">
+          <div class="entity-name">${l.friendly_name}</div>
+          <div class="entity-eid">${l.entity_id}</div>
+          ${bar}
+        </div>
+        <div class="entity-val ${isOn?'on':''}">${val}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderMotion(sensors) {
+  if (!sensors.length) return '<div class="empty">Žádná pohybová čidla nebyla nalezena</div>';
+  return sensors.map(s => {
+    const isOn = s.state === 'on';
+    return `
+      <div class="entity">
+        <span class="dot ${dotClass(s.state)}"></span>
+        <div class="entity-info">
+          <div class="entity-name">${s.friendly_name}</div>
+          <div class="entity-eid">${s.entity_id}</div>
+        </div>
+        <div class="entity-val ${isOn?'on':''}">${isOn ? '● POHYB' : 'KLID'}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderLux(sensors) {
+  if (!sensors.length) return '<div class="empty">Žádné lux senzory nebyly nalezeny</div>';
+  const vals = sensors.map(s => parseFloat(s.state)).filter(v => !isNaN(v));
+  const maxV  = vals.length ? Math.max(...vals) : 1;
+  return sensors.map(s => {
+    const v   = parseFloat(s.state);
+    const ok  = !isNaN(v);
+    const pct = ok && maxV > 0 ? (v/maxV)*100 : 0;
+    return `
+      <div class="entity">
+        <span class="dot ${ok?'dot-lux':'dot-off'}"></span>
+        <div class="entity-info">
+          <div class="entity-name">${s.friendly_name}</div>
+          <div class="entity-eid">${s.entity_id}</div>
+          ${ok ? `<div class="bar-wrap"><div class="bar-fill bar-lux" style="width:${pct}%"></div></div>` : ''}
+        </div>
+        <div class="entity-val ${ok?'lux':''}">${ok ? fmt.num(v)+' '+s.unit : s.state}</div>
+      </div>`;
+  }).join('');
+}
+
+/* ── Data load ───────────────────────────────────── */
+async function refresh() {
+  const icon = document.getElementById('refreshIcon');
+  icon.className = 'spin'; icon.textContent = '↻';
+
+  try {
+    const r = await fetch('api/entities');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+
+    const elev = d.sun?.elevation != null ? Number(d.sun.elevation).toFixed(0)+'°' : '—';
+
+    document.getElementById('lastUpdated').textContent =
+      'Aktualizováno: ' + new Date().toLocaleTimeString('cs-CZ');
+
+    document.getElementById('root').innerHTML = `
+      <div class="stats-bar">
+        <div class="stat"><div class="stat-num">${d.counts.lights}</div><div class="stat-lbl">💡 Světla</div></div>
+        <div class="stat"><div class="stat-num">${d.counts.motion}</div><div class="stat-lbl">🚶 Pohyb. čidla</div></div>
+        <div class="stat"><div class="stat-num">${d.counts.lux}</div><div class="stat-lbl">🔆 Lux senzory</div></div>
+        <div class="stat"><div class="stat-num">${elev}</div><div class="stat-lbl">☀️ Elevace</div></div>
+      </div>
+
+      <div class="section">
+        <div class="section-hdr"><span>☀️</span><span class="section-title">Slunce</span></div>
+        ${renderSun(d.sun)}
+      </div>
+
+      <div class="section">
+        <div class="section-hdr">
+          <span>💡</span><span class="section-title">Světla</span>
+          <span class="badge">${d.counts.lights}</span>
+        </div>
+        <div class="entity-grid">${renderLights(d.lights)}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-hdr">
+          <span>🚶</span><span class="section-title">Pohybová čidla</span>
+          <span class="badge">${d.counts.motion}</span>
+        </div>
+        <div class="entity-grid">${renderMotion(d.motion_sensors)}</div>
+      </div>
+
+      <div class="section">
+        <div class="section-hdr">
+          <span>🔆</span><span class="section-title">Světelné senzory (Lux)</span>
+          <span class="badge">${d.counts.lux}</span>
+        </div>
+        <div class="entity-grid">${renderLux(d.lux_sensors)}</div>
+      </div>`;
+
+    if (d.sun) setTimeout(() => drawCompass(d.sun.azimuth, d.sun.elevation), 30);
+
+  } catch(e) {
+    document.getElementById('root').innerHTML =
+      `<div class="error-box">⚠️ Chyba: ${e.message}<br><small>Zkontrolujte, zda má doplněk přístup k HA API.</small></div>`;
+  }
+
+  icon.className = ''; icon.textContent = '↻';
+}
+
+/* ── Auto-refresh (30 s) ─────────────────────────── */
+let cd = 30;
+function tick() {
+  cd--;
+  document.getElementById('countdown').textContent = `Auto-refresh: ${cd}s`;
+  if (cd <= 0) { cd = 30; refresh(); }
+}
+refresh();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
