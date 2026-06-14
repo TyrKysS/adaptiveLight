@@ -3,7 +3,7 @@ FROM $BUILD_FROM
 
 ENV PYTHONUNBUFFERED=1
 
-RUN apk add --no-cache python3 py3-pip py3-aiohttp
+RUN apk add --no-cache python3 py3-pip
 
 COPY requirements.txt /tmp/
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
