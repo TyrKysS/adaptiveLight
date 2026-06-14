@@ -6,7 +6,9 @@ import time
 from datetime import datetime
 
 import aiohttp
+import numpy as np
 import requests
+from rl_agent import ACTIONS, RLAgent
 from flask import Flask, jsonify, render_template
 from flask import request as freq
 
@@ -23,6 +25,11 @@ DEFAULT_CONFIG = {
     "lux_threshold": 50,
     "automation_enabled": False,
     "auto_turn_off": False,
+    # RL regulation
+    "rl_enabled": False,
+    "rl_target_lux": 100,
+    "rl_input_sensors": [],
+    "rl_output_lights": [],
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -98,6 +105,20 @@ _auto_status: dict = {
 def _set_status(**kw) -> None:
     with _status_lock:
         _auto_status.update(kw)
+
+
+# ── RL agent singleton ────────────────────────────────────────────────────────
+
+_rl_agent: "RLAgent | None" = None
+_rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
+_rl_lock = threading.Lock()
+
+
+def _get_rl_agent() -> RLAgent:
+    global _rl_agent
+    if _rl_agent is None:
+        _rl_agent = RLAgent()
+    return _rl_agent
 
 
 def _now() -> str:
@@ -190,6 +211,54 @@ async def _apply_rule(ws, entity_id: str, lux_val: float, mid: list) -> None:
                     threshold=thr, error=None, trigger=entity_id)
 
 
+async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
+    """RL brightness regulation — called from WebSocket event loop."""
+    global _rl_brightness
+    cfg    = load_config()
+    lights = cfg.get("rl_output_lights", [])
+    target = float(cfg.get("rl_target_lux", 100))
+
+    if not lights:
+        return
+
+    agent = _get_rl_agent()
+    with _rl_lock:
+        cur_br = _rl_brightness
+
+    state = RLAgent.build_state(lux_val, target, cur_br,
+                                agent.prev_lux, agent.prev_action_idx)
+
+    if agent.prev_state is not None:
+        reward            = RLAgent.compute_reward(lux_val, target, agent.prev_lux)
+        agent.last_reward = reward
+        agent.remember(agent.prev_state, agent.prev_action_idx, reward, state)
+        agent.replay()
+
+    action_idx = agent.act(state)
+    delta      = ACTIONS[action_idx]
+    with _rl_lock:
+        new_br        = float(np.clip(_rl_brightness + delta, 5, 100))
+        _rl_brightness = new_br
+    brightness_255 = int(new_br / 100 * 255)
+
+    for lid in lights:
+        mid[0] += 1
+        await ws.send_json({
+            "id": mid[0], "type": "call_service",
+            "domain": "light", "service": "turn_on",
+            "service_data": {"entity_id": lid, "brightness": brightness_255},
+        })
+
+    agent.prev_state      = state
+    agent.prev_action_idx = action_idx
+    agent.prev_lux        = lux_val
+    agent.last_delta      = delta
+
+    _set_status(last_run=_now(), action=f"rl_br_{int(new_br)}",
+                lux=round(lux_val, 1), threshold=target,
+                trigger=entity_id, error=None)
+
+
 async def _ws_session() -> None:
     token = os.environ.get("HA_TOKEN", "")
     mid = [0]
@@ -238,8 +307,20 @@ async def _ws_session() -> None:
                         continue
 
                     eid = new_state.get("entity_id", "")
+                    cfg = load_config()
 
-                    if eid not in load_config().get("selected_lux_sensors", []):
+                    # RL path takes priority when enabled
+                    if cfg.get("rl_enabled") and eid in cfg.get("rl_input_sensors", []):
+                        try:
+                            lux_val = float(new_state["state"])
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            await _apply_rl(ws, eid, lux_val, mid)
+                        continue
+
+                    # Threshold path (existing)
+                    if eid not in cfg.get("selected_lux_sensors", []):
                         continue
 
                     try:
@@ -368,6 +449,30 @@ def automation_status():
 @app.route("/api/automation/run", methods=["POST"])
 def automation_run():
     threading.Thread(target=run_automation_once, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rl/status")
+def rl_status():
+    cfg   = load_config()
+    agent = _get_rl_agent()
+    with _rl_lock:
+        br = _rl_brightness
+    return jsonify({
+        **agent.info(),
+        "enabled":            cfg.get("rl_enabled", False),
+        "target_lux":         cfg.get("rl_target_lux", 100),
+        "current_brightness": round(br, 1),
+    })
+
+
+@app.route("/api/rl/reset", methods=["POST"])
+def rl_reset():
+    _get_rl_agent().reset_model()
+    try:
+        os.remove("/data/rl_model.json")
+    except FileNotFoundError:
+        pass
     return jsonify({"ok": True})
 
 

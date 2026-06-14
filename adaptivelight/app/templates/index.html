@@ -234,6 +234,22 @@
       canvas#sunCompass { margin: 0 auto; }
       .settings-grid { grid-template-columns: 1fr; }
     }
+
+    /* ── RL status card ── */
+    .rl-card {
+      background: var(--bg-card); border: 1px solid rgba(59,130,246,.25); border-radius: var(--r);
+      padding: 16px 20px; margin-bottom: 18px;
+      display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap;
+    }
+    .rl-stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px;
+      margin-top: 4px;
+    }
+    .rl-stat { background: var(--bg-inset); border-radius: var(--r-sm); padding: 9px 12px; }
+    .rl-stat-lbl { font-size: .62rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+    .rl-stat-val { font-size: 1.1rem; font-weight: 700; }
+    .btn-danger { color: var(--red); border-color: rgba(239,68,68,.35); }
+    .btn-danger:hover { background: rgba(239,68,68,.08); }
   </style>
 </head>
 <body>
@@ -254,6 +270,7 @@
 <div class="tabs">
   <button class="tab-btn active" onclick="switchTab('overview', this)">📊 Přehled</button>
   <button class="tab-btn" onclick="switchTab('settings', this)">⚙️ Nastavení</button>
+  <button class="tab-btn" onclick="switchTab('rl', this)">🧠 RL Regulace</button>
 </div>
 
 <!-- ════════════════════════════════════════════════════════ -->
@@ -270,6 +287,13 @@
   <div id="settingsRoot"><div class="loading">⏳ Načítám nastavení…</div></div>
 </div>
 
+<!-- ════════════════════════════════════════════════════════ -->
+<!--  TAB: RL REGULACE                                      -->
+<!-- ════════════════════════════════════════════════════════ -->
+<div id="tab-rl" class="tab-pane">
+  <div id="rlRoot"><div class="loading">⏳ Načítám…</div></div>
+</div>
+
 <!-- toast -->
 <div class="toast" id="toast"></div>
 
@@ -280,6 +304,7 @@
 let _entities = null;   // last fetched entities
 let _cfg = null;        // current config (working copy in settings)
 let _savedCfg = null;   // last saved config (for dirty detection)
+let _rlStatus = null;   // last fetched RL status
 
 /* ═══════════════════════════════════════════
    TABS
@@ -290,6 +315,7 @@ function switchTab(name, btn) {
   document.getElementById('tab-' + name).classList.add('active');
   btn.classList.add('active');
   if (name === 'settings') loadSettings();
+  if (name === 'rl') loadRL();
 }
 
 /* ═══════════════════════════════════════════
@@ -470,19 +496,57 @@ function renderLux(sensors) {
 }
 
 /* ═══════════════════════════════════════════
+   RL OVERVIEW CARD
+═══════════════════════════════════════════ */
+function renderRLCard(rl) {
+  if (!rl || !rl.enabled) return '';
+  const target = rl.target_lux ?? '—';
+  const br     = rl.current_brightness != null ? rl.current_brightness.toFixed(0) + ' %' : '—';
+  const steps  = rl.train_steps ?? 0;
+  const eps    = rl.epsilon != null ? (rl.epsilon * 100).toFixed(0) + ' %' : '—';
+  const mem    = rl.memory_size ?? 0;
+  const delta  = rl.last_delta != null
+    ? (rl.last_delta > 0 ? '+' : '') + rl.last_delta + ' %'
+    : '—';
+  const reward = rl.last_reward != null ? rl.last_reward.toFixed(2) : '—';
+  const dCls   = rl.last_delta > 0 ? 'action-on' : rl.last_delta < 0 ? 'action-off' : '';
+  const rStyle = rl.last_reward > 0 ? 'color:var(--green)' : rl.last_reward < 0 ? 'color:var(--red)' : '';
+
+  return `
+    <div class="rl-card">
+      <div class="auto-icon">🧠</div>
+      <div class="auto-body">
+        <div class="auto-title">
+          RL Regulace světla
+          <span style="font-size:.75rem;font-weight:400;color:#3b82f6"> ● Aktivní</span>
+        </div>
+        <div class="auto-rule">Cíl: <b>${target} lx</b> · Aktuální jas: <b>${br}</b></div>
+        <div class="auto-meta">
+          <div class="auto-chip">📈 Kroky: ${steps}</div>
+          <div class="auto-chip" style="color:var(--purple)">🎲 Průzkum: ${eps}</div>
+          <div class="auto-chip">💾 Paměť: ${mem} / 4000</div>
+          <div class="auto-chip ${dCls}">Δ jas: ${delta}</div>
+          <div class="auto-chip" style="${rStyle}">Odměna: ${reward}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ═══════════════════════════════════════════
    OVERVIEW LOAD
 ═══════════════════════════════════════════ */
 async function refreshOverview() {
   const icon=document.getElementById('refreshIcon');
   icon.className='spin'; icon.textContent='↻';
   try {
-    const [entResp, autoResp, cfgResp] = await Promise.all([
-      fetch('api/entities'), fetch('api/automation/status'), fetch('api/config')
+    const [entResp, autoResp, cfgResp, rlResp] = await Promise.all([
+      fetch('api/entities'), fetch('api/automation/status'), fetch('api/config'), fetch('api/rl/status')
     ]);
     if (!entResp.ok) throw new Error(`HTTP ${entResp.status}`);
     const d = await entResp.json();
     const autoSt = autoResp.ok ? await autoResp.json() : null;
     const cfg = cfgResp.ok ? await cfgResp.json() : null;
+    _rlStatus = rlResp.ok ? await rlResp.json() : null;
 
     _entities = d;
     document.getElementById('lastUpdated').textContent = 'Aktualizováno: '+new Date().toLocaleTimeString('cs-CZ');
@@ -498,6 +562,7 @@ async function refreshOverview() {
       </div>
 
       ${renderAutoCard(autoSt, cfg)}
+      ${renderRLCard(_rlStatus)}
 
       <div class="section">
         <div class="section-hdr"><span>☀️</span><span class="section-title">Slunce</span></div>
@@ -669,7 +734,10 @@ function cfgSet(key, val) {
 }
 
 function toggleEntity(group, eid, checked) {
-  const keyMap = {lights:'selected_lights', lux:'selected_lux_sensors', motion:'selected_motion_sensors'};
+  const keyMap = {
+    lights:'selected_lights', lux:'selected_lux_sensors', motion:'selected_motion_sensors',
+    rl_sensors:'rl_input_sensors', rl_lights:'rl_output_lights'
+  };
   const key = keyMap[group];
   if (checked) {
     if (!_cfg[key].includes(eid)) _cfg[key] = [..._cfg[key], eid];
@@ -677,14 +745,18 @@ function toggleEntity(group, eid, checked) {
     _cfg[key] = _cfg[key].filter(e => e !== eid);
   }
   // update badge counts
-  const badgeMap = {lights:'cl-lights', lux:'cl-lux', motion:'cl-motion'};
+  const badgeMap = {
+    lights:'cl-lights', lux:'cl-lux', motion:'cl-motion',
+    rl_sensors:'rl-cl-sensors', rl_lights:'rl-cl-lights'
+  };
+  const totalMap = {
+    lights:_entities?.counts?.lights, lux:_entities?.counts?.lux, motion:_entities?.counts?.motion,
+    rl_sensors:_entities?.counts?.lux, rl_lights:_entities?.counts?.lights
+  };
   const card = document.getElementById(badgeMap[group])?.closest('.settings-card');
   if (card) {
     const badge = card.querySelector('.badge');
-    if (badge) {
-      const total = {lights:_entities?.counts?.lights, lux:_entities?.counts?.lux, motion:_entities?.counts?.motion}[group]??0;
-      badge.textContent = `${_cfg[key].length} / ${total}`;
-    }
+    if (badge) badge.textContent = `${_cfg[key].length} / ${totalMap[group]??0}`;
   }
 }
 
@@ -704,6 +776,191 @@ async function saveSettings() {
   } catch(e) {
     hint.textContent = 'Chyba při ukládání.';
     showToast('Chyba: '+e.message, true);
+  }
+}
+
+/* ═══════════════════════════════════════════
+   RL TAB
+═══════════════════════════════════════════ */
+function rlStatsHtml(rl) {
+  if (!rl) return '<div class="empty-check">Stavy nejsou k dispozici.</div>';
+  const steps  = rl.train_steps ?? 0;
+  const eps    = rl.epsilon != null ? (rl.epsilon * 100).toFixed(0) + ' %' : '—';
+  const mem    = `${rl.memory_size ?? 0} / 4000`;
+  const br     = rl.current_brightness != null ? rl.current_brightness.toFixed(0) + ' %' : '—';
+  const delta  = rl.last_delta != null ? (rl.last_delta > 0 ? '+' : '') + rl.last_delta + ' %' : '—';
+  const reward = rl.last_reward != null ? rl.last_reward.toFixed(3) : '—';
+  const dColor = rl.last_delta > 0 ? 'var(--green)' : rl.last_delta < 0 ? 'var(--blue)' : 'var(--text-dim)';
+  const rColor = rl.last_reward > 0 ? 'var(--green)' : rl.last_reward < 0 ? 'var(--red)' : 'var(--text-muted)';
+  return `
+    <div class="rl-stats-grid">
+      <div class="rl-stat"><div class="rl-stat-lbl">Kroky tréninku</div><div class="rl-stat-val">${steps}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Průzkum (ε)</div><div class="rl-stat-val" style="color:var(--purple)">${eps}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Paměť</div><div class="rl-stat-val" style="font-size:.9rem">${mem}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Aktuální jas</div><div class="rl-stat-val" style="color:var(--accent)">${br}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Poslední krok</div><div class="rl-stat-val" style="color:${dColor}">${delta}</div></div>
+      <div class="rl-stat"><div class="rl-stat-lbl">Odměna</div><div class="rl-stat-val" style="color:${rColor}">${reward}</div></div>
+    </div>`;
+}
+
+async function loadRL() {
+  document.getElementById('rlRoot').innerHTML = '<div class="loading">⏳ Načítám…</div>';
+  try {
+    const [cfgResp, entResp, rlResp] = await Promise.all([
+      fetch('api/config'), fetch('api/entities'), fetch('api/rl/status')
+    ]);
+    _savedCfg = await cfgResp.json();
+    _cfg = JSON.parse(JSON.stringify(_savedCfg));
+    _entities = await entResp.json();
+    _rlStatus = rlResp.ok ? await rlResp.json() : null;
+    renderRL();
+  } catch(e) {
+    document.getElementById('rlRoot').innerHTML =
+      `<div class="error-box">⚠️ Nelze načíst: ${e.message}</div>`;
+  }
+}
+
+function renderRL() {
+  const c = _cfg, ents = _entities, rl = _rlStatus;
+  document.getElementById('rlRoot').innerHTML = `
+
+    <div style="margin-bottom:14px;color:var(--text-muted);font-size:.82rem;line-height:1.6;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px">
+      <b style="color:var(--text)">Jak to funguje:</b>
+      Neuronová síť (Q-learning) sleduje lux senzory a reguluje jas vybraných světel tak, aby udržovala cílovou hodnotu osvětlení.
+      Při každé změně lux hodnoty agent zvolí krok jasu (−25 % až +25 %), obdrží odměnu dle přesnosti a aktualizuje svůj model.
+      Čím více kroků agent natrénuje, tím přesněji reguluje.
+    </div>
+
+    <div class="settings-grid">
+
+      <!-- ── Zapnutí + Cíl ── -->
+      <div class="settings-card">
+        <div class="settings-card-title">🧠 RL Regulace</div>
+
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Aktivovat RL regulaci</div>
+            <div class="toggle-desc">Neuronová síť reguluje jas světel podle lux senzorů</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" ${c.rl_enabled?'checked':''} onchange="cfgSet('rl_enabled',this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div style="margin-top:18px">
+          <div style="font-size:.82rem;font-weight:600;margin-bottom:10px;color:var(--text-dim)">🎯 Cílová intenzita osvětlení</div>
+          <div class="lux-control">
+            <div class="lux-value-row">
+              <input type="number" class="lux-number" id="rl-target" min="1" max="5000" step="5"
+                value="${c.rl_target_lux}"
+                oninput="cfgSet('rl_target_lux',+this.value);document.getElementById('rl-range').value=this.value">
+              <span class="lux-unit">lux</span>
+            </div>
+            <input type="range" id="rl-range" min="1" max="2000" step="5" value="${Math.min(c.rl_target_lux,2000)}"
+              oninput="cfgSet('rl_target_lux',+this.value);document.getElementById('rl-target').value=this.value">
+            <div class="lux-hint">
+              Typické hodnoty: čtení 300–500 lx · práce u PC 200–400 lx · večerní odpočinek 50–150 lx · večeře 100–300 lx.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Stav tréninku ── -->
+      <div class="settings-card">
+        <div class="settings-card-title">📈 Stav tréninku</div>
+        ${rlStatsHtml(rl)}
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-danger" style="flex:1;justify-content:center" onclick="resetRLModel()">
+            🗑 Resetovat model
+          </button>
+          <button class="btn" style="flex:1;justify-content:center" onclick="refreshRLStats()">
+            ↻ Obnovit stav
+          </button>
+        </div>
+        <div style="margin-top:10px;font-size:.7rem;color:var(--text-muted)">
+          ε = míra průzkumu (klesá s tréninkem). Model se ukládá automaticky každých 50 kroků do <code>/data/rl_model.json</code>.
+        </div>
+      </div>
+
+      <!-- ── Vstupní lux senzory ── -->
+      <div class="settings-card">
+        <div class="settings-card-title">🔆 Vstupní lux senzory
+          <span class="badge">${c.rl_input_sensors.length} / ${ents?.counts?.lux??0}</span>
+        </div>
+        <div class="lux-hint" style="margin-bottom:10px">
+          Senzory, jejichž hodnoty RL agent sleduje jako vstup (stav prostředí).
+        </div>
+        <div class="checklist" id="rl-cl-sensors">
+          ${renderChecklist(ents?.lux_sensors??[], c.rl_input_sensors, 'rl_sensors',
+            s=>`${s.state} ${s.unit}`)}
+        </div>
+      </div>
+
+      <!-- ── Výstupní světla ── -->
+      <div class="settings-card">
+        <div class="settings-card-title">💡 Výstupní světla
+          <span class="badge">${c.rl_output_lights.length} / ${ents?.counts?.lights??0}</span>
+        </div>
+        <div class="lux-hint" style="margin-bottom:10px">
+          Světla, jejichž jas RL agent ovládá. Musí podporovat regulaci jasu (dim).
+        </div>
+        <div class="checklist" id="rl-cl-lights">
+          ${renderChecklist(ents?.lights??[], c.rl_output_lights, 'rl_lights')}
+        </div>
+      </div>
+
+    </div><!-- /settings-grid -->
+
+    <div class="save-bar">
+      <span class="save-hint" id="rl-save-hint">Nastavení se uloží a okamžitě aplikují.</span>
+      <button class="btn btn-primary" onclick="saveRL()">💾 Uložit nastavení</button>
+    </div>`;
+}
+
+async function saveRL() {
+  const hint = document.getElementById('rl-save-hint');
+  hint.textContent = '⏳ Ukládám…';
+  try {
+    const r = await fetch('api/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(_cfg)
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    _savedCfg = JSON.parse(JSON.stringify(_cfg));
+    hint.textContent = 'Nastavení se uloží a okamžitě aplikují.';
+    showToast('✔ RL nastavení uloženo');
+    await refreshRLStats();
+  } catch(e) {
+    hint.textContent = 'Chyba při ukládání.';
+    showToast('Chyba: ' + e.message, true);
+  }
+}
+
+async function refreshRLStats() {
+  try {
+    const r = await fetch('api/rl/status');
+    if (r.ok) {
+      _rlStatus = await r.json();
+      const el = document.getElementById('rlRoot');
+      if (el) renderRL();
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function resetRLModel() {
+  if (!confirm('Opravdu smazat naučený model? Tato akce je nevratná.')) return;
+  try {
+    const r = await fetch('api/rl/reset', {method:'POST'});
+    if (r.ok) {
+      showToast('✔ Model byl resetován');
+      await refreshRLStats();
+    } else {
+      showToast('Chyba při resetování', true);
+    }
+  } catch(e) {
+    showToast('Chyba: ' + e.message, true);
   }
 }
 
