@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "rl_output_lights": [],
     "rl_night_only": False,
     "rl_sun_threshold": 0.0,   # degrees; RL runs only when sun elevation < this
+    "rl_action_cooldown": 3.0, # seconds between successive RL brightness adjustments
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -114,7 +115,6 @@ def _set_status(**kw) -> None:
 _rl_agent: "RLAgent | None" = None
 _rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
 _rl_last_action_ts: float = 0.0
-_rl_action_cooldown: float = 10.0  # seconds between RL actions
 _rl_lock = threading.Lock()
 _sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
 
@@ -239,7 +239,8 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         return
 
     now = time.monotonic()
-    if now - _rl_last_action_ts < _rl_action_cooldown:
+    cooldown = float(cfg.get("rl_action_cooldown", 3.0))
+    if now - _rl_last_action_ts < cooldown:
         return
 
     if cfg.get("rl_night_only", False):
@@ -469,12 +470,19 @@ def post_config():
     if not body:
         return jsonify({"error": "Chybí JSON tělo"}), 400
     cfg = load_config()
+    old_target = cfg.get("rl_target_lux")
     for k, v in body.items():
         if k in DEFAULT_CONFIG:
             cfg[k] = v
     save_config(cfg)
+    if cfg.get("rl_target_lux") != old_target:
+        agent = _get_rl_agent()
+        agent.memory.clear()
+        agent.prev_state = None
+        agent.prev_lux = None
+        app.logger.info("RL target changed %s→%s: replay buffer flushed", old_target, cfg["rl_target_lux"])
     threading.Thread(target=run_automation_once, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "buffer_flushed": cfg.get("rl_target_lux") != old_target})
 
 
 @app.route("/api/automation/status")

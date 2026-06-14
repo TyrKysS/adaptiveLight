@@ -889,7 +889,24 @@ function renderRL() {
               oninput="cfgSet('rl_target_lux',+this.value);document.getElementById('rl-target').value=this.value">
             <div class="lux-hint">
               Typické hodnoty: čtení 300–500 lx · práce u PC 200–400 lx · večerní odpočinek 50–150 lx · večeře 100–300 lx.
+              <br>⚠️ Změna cíle automaticky vymaže replay buffer (stará zkušenost by mátla síť).
             </div>
+          </div>
+        </div>
+
+        <div style="margin-top:18px">
+          <div style="font-size:.82rem;font-weight:600;margin-bottom:10px;color:var(--text-dim)">⏱ Prodleva mezi akcemi</div>
+          <div class="lux-control">
+            <div class="lux-value-row">
+              <input type="number" class="lux-number" style="width:90px" id="rl-cooldown"
+                min="1" max="60" step="1"
+                value="${c.rl_action_cooldown ?? 3}"
+                oninput="cfgSet('rl_action_cooldown',+this.value)">
+              <span class="lux-unit">sekund</span>
+            </div>
+            <input type="range" min="1" max="30" step="1" value="${Math.min(c.rl_action_cooldown??3, 30)}"
+              oninput="cfgSet('rl_action_cooldown',+this.value);document.getElementById('rl-cooldown').value=this.value">
+            <div class="lux-hint">Minimální čas mezi dvěma RL akcemi. Nižší = rychlejší reakce. Doporučeno: 3–5 s.</div>
           </div>
         </div>
       </div>
@@ -949,6 +966,7 @@ function renderRL() {
 async function saveRL() {
   const hint = document.getElementById('rl-save-hint');
   hint.textContent = '⏳ Ukládám…';
+  const targetChanged = _cfg.rl_target_lux !== _savedCfg.rl_target_lux;
   try {
     const r = await fetch('api/config', {
       method: 'POST',
@@ -958,7 +976,7 @@ async function saveRL() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     _savedCfg = JSON.parse(JSON.stringify(_cfg));
     hint.textContent = 'Nastavení se uloží a okamžitě aplikují.';
-    showToast('✔ RL nastavení uloženo');
+    showToast(targetChanged ? '✔ Cíl změněn — replay buffer vymazán' : '✔ RL nastavení uloženo');
     await refreshRLStats();
   } catch(e) {
     hint.textContent = 'Chyba při ukládání.';
