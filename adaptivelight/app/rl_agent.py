@@ -80,10 +80,14 @@ class DigitalTwin:
         self.calib     = calib
         self.noise_std = max(noise_std, 0.0)
 
-    def step(self, brightness: float, delta: int) -> tuple:
-        """Apply brightness delta; return (new_brightness, simulated_lux)."""
+    def step(self, brightness: float, delta: int, ambient: float = 0.0) -> tuple:
+        """Apply brightness delta; return (new_brightness, simulated_lux).
+
+        ambient: persistent lux offset for this episode (models changed external
+                 conditions — closed blinds give negative offset, sunlight positive).
+        """
         new_br = float(np.clip(brightness + delta, 5, 100))
-        lux    = self.calib.lux_for_brightness(new_br)
+        lux    = self.calib.lux_for_brightness(new_br) + ambient
         if self.noise_std > 0:
             lux += float(np.random.normal(0.0, self.noise_std))
         return new_br, max(0.0, lux)
@@ -238,15 +242,29 @@ class RLAgent:
                     goal_lux = float(np.random.uniform(lux_min, lux_max))
                 goal_lux = max(1.0, goal_lux)
 
+                # 40 % of episodes simulate changed ambient conditions (e.g. closed blinds
+                # or extra sunlight). The offset is constant within the episode so the
+                # agent learns: "calibration is just a starting point — keep adjusting
+                # based on the actual lux error."
+                # Negative offset (darker): lamp must overshoot calibration to reach goal.
+                # Positive offset (brighter): lamp must undershoot.
+                if random.random() < 0.40:
+                    max_offset = max(lux_max * 0.6, 5.0)
+                    ambient = float(np.random.uniform(-max_offset, max_offset * 0.5))
+                else:
+                    ambient = 0.0
+
                 # 25 % of episodes start from a random brightness across the full range.
                 # This teaches the agent what to do at extremes it might reach in real life
                 # (e.g. brightness=5 % with lux still below target due to ambient light).
-                if random.random() < 0.25:
+                # When ambient is non-zero, always start random so the agent explores
+                # the full space under shifted conditions.
+                if random.random() < 0.25 or ambient != 0.0:
                     init_br = float(np.random.uniform(5, 100))
                 else:
                     init_br = calib.brightness_for_lux(goal_lux)
                     init_br = float(np.clip(init_br + np.random.normal(0, 5), 5, 100))
-                cur_br, cur_lux = twin.step(init_br, 0)
+                cur_br, cur_lux = twin.step(init_br, 0, ambient)
 
                 prev_lux = None
                 prev_idx = ACTIONS.index(0)
@@ -258,7 +276,7 @@ class RLAgent:
                     action_idx = self.act_guarded(state, cur_lux, goal_lux)
                     delta      = ACTIONS[action_idx]
 
-                    new_br, new_lux = twin.step(cur_br, delta)
+                    new_br, new_lux = twin.step(cur_br, delta, ambient)
 
                     # 5 % of steps: inject a disturbance (sensor covered → lux≈0,
                     # or sudden bright ambient → lux≫max). Teaches the network the
