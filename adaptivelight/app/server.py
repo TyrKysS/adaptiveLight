@@ -8,7 +8,7 @@ from datetime import datetime
 import aiohttp
 import numpy as np
 import requests
-from rl_agent import ACTIONS, RLAgent
+from rl_agent import ACTIONS, MODEL_PATH, RLAgent
 from rl_calibration import (CalibrationData, load_calibration, save_calibration,
                              invalidate_cache, CALIB_STEPS, CALIB_SETTLE)
 from flask import Flask, jsonify, render_template, Response
