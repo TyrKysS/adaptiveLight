@@ -11,7 +11,7 @@ import os
 
 CALIB_PATH   = "/data/rl_calibration.json"
 CALIB_STEPS  = [0, 20, 40, 60, 80, 100]   # brightness % measured in order
-CALIB_SETTLE = 5.0                          # seconds to wait after each brightness change
+CALIB_SETTLE = 10.0                         # seconds to wait after each brightness change
 
 
 class CalibrationData:
