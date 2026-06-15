@@ -11,7 +11,7 @@ import requests
 from rl_agent import ACTIONS, RLAgent
 from rl_calibration import (CalibrationData, load_calibration, save_calibration,
                              invalidate_cache, CALIB_STEPS, CALIB_SETTLE)
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, Response
 from flask import request as freq
 
 app = Flask(__name__)
@@ -852,6 +852,41 @@ def rl_set_target():
             lights = cfg.get("rl_output_lights", [])
             _set_rl_brightness_rest(calib.brightness_for_lux(new_target), lights)
     return jsonify({"ok": True, "target_lux": new_target})
+
+
+@app.route("/api/rl/export")
+def rl_export():
+    """Bundle model weights, calibration curve and RL config for offline experiments."""
+    bundle: dict = {
+        "export_timestamp": _now(),
+        "model":            None,
+        "calibration":      None,
+        "config":           None,
+        "sim_status":       None,
+    }
+
+    try:
+        with open(MODEL_PATH) as fh:
+            bundle["model"] = json.load(fh)
+    except FileNotFoundError:
+        pass
+
+    calib = load_calibration()
+    if calib:
+        bundle["calibration"] = calib.to_dict()
+
+    cfg = load_config()
+    bundle["config"] = {k: v for k, v in cfg.items() if k.startswith("rl_")}
+
+    with _sim_lock:
+        bundle["sim_status"] = dict(_sim_status)
+
+    filename = f"adaptivelight_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    return Response(
+        json.dumps(bundle, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────

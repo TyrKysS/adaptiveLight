@@ -1070,6 +1070,9 @@ function renderRL() {
           <button class="btn" style="flex:1;justify-content:center" onclick="refreshRLStats()">
             ↻ Obnovit stav
           </button>
+          <button class="btn" style="flex:1;justify-content:center" onclick="exportRL()">
+            ⬇ Exportovat
+          </button>
         </div>
         <div style="margin-top:10px;font-size:.7rem;color:var(--text-muted)">
           ε = míra průzkumu (klesá s tréninkem). Model se ukládá automaticky každých 50 kroků do <code>/data/rl_model.json</code>.
@@ -1156,6 +1159,22 @@ async function resetRLModel() {
   } catch(e) {
     showToast('Chyba: ' + e.message, true);
   }
+}
+
+async function exportRL() {
+  try {
+    const r = await fetch('api/rl/export');
+    if (!r.ok) { showToast('Export selhal', true); return; }
+    const blob = await r.blob();
+    const cd   = r.headers.get('Content-Disposition') || '';
+    const m    = cd.match(/filename="([^"]+)"/);
+    const name = m ? m[1] : 'adaptivelight_model.json';
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+    showToast('✔ Export stažen');
+  } catch(e) { showToast('Chyba: ' + e.message, true); }
 }
 
 /* ═══════════════════════════════════════════
