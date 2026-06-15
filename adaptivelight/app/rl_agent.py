@@ -1,9 +1,10 @@
 """
-Q-learning agent for closed-loop lux-based brightness regulation.
+Multi-goal Q-learning for closed-loop lux regulation.
 
-State  : [lux_error_norm, brightness_norm, lux_trend_norm, prev_action_norm]
-Actions: discrete brightness-delta steps (percentage points, 0-100 scale)
-Reward : proximity bonus — best at <5% error from target
+Training happens entirely in simulation (digital twin from calibration curve).
+State  : [lux_error_norm, brightness_norm, lux_trend_norm, prev_action_norm, goal_norm]
+Q(s, g, a) — goal g is embedded as the 5th state dimension.
+After simulation: epsilon=0, lr=lr_live so live operation only fine-tunes.
 """
 
 import json
@@ -16,8 +17,9 @@ import numpy as np
 
 ACTIONS    = [-25, -15, -10, -5, -2, 0, 2, 5, 10, 15, 25]
 N_ACTIONS  = len(ACTIONS)
-STATE_SIZE = 4
+STATE_SIZE = 5          # [err, br, trend, prev_action, goal]
 MODEL_PATH = "/data/rl_model.json"
+LUX_GOAL_SCALE = 1000.0  # goal normalisation constant
 
 
 # ── Neural network ────────────────────────────────────────────────────────────
@@ -69,30 +71,51 @@ class _NN:
         return inst
 
 
+# ── Digital twin ──────────────────────────────────────────────────────────────
+
+class DigitalTwin:
+    """Simulated lux environment from calibration curve + Gaussian sensor noise."""
+
+    def __init__(self, calib, noise_std: float = 2.0) -> None:
+        self.calib     = calib
+        self.noise_std = max(noise_std, 0.0)
+
+    def step(self, brightness: float, delta: int) -> tuple:
+        """Apply brightness delta; return (new_brightness, simulated_lux)."""
+        new_br = float(np.clip(brightness + delta, 5, 100))
+        lux    = self.calib.lux_for_brightness(new_br)
+        if self.noise_std > 0:
+            lux += float(np.random.normal(0.0, self.noise_std))
+        return new_br, max(0.0, lux)
+
+
 # ── RL agent ──────────────────────────────────────────────────────────────────
 
 class RLAgent:
-    """DQN-style agent: online Q-net, frozen target net, experience replay."""
+    """DQN multi-goal agent: online Q-net, frozen target net, experience replay."""
 
     LAYERS = [STATE_SIZE, 32, 16, N_ACTIONS]
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.q_net     = _NN(self.LAYERS)
+        self.q_net      = _NN(self.LAYERS)
         self.target_net = _NN(self.LAYERS)
         self.target_net.copy_weights_from(self.q_net)
 
-        self.memory: deque = deque(maxlen=4_000)
-        self.epsilon:       float = 0.60
-        self.epsilon_min:   float = 0.05
+        self.memory: deque  = deque(maxlen=4_000)
+        self.epsilon:  float = 0.60
+        self.epsilon_min: float = 0.05
         self.epsilon_decay: float = 0.99
-        self.gamma:         float = 0.95
-        self.lr:            float = 5e-4
-        self.batch:         int   = 8
-        self.steps:         int   = 0
-        self.target_freq:   int   = 50
+        self.gamma:    float = 0.95
+        self.lr:       float = 5e-4   # active learning rate; overwritten by set_live_mode
+        self.lr_live:  float = 0.02   # fine-tuning LR after simulation
+        self.batch:    int   = 8
+        self.steps:    int   = 0
+        self.target_freq: int = 50
+        self.trained_by_sim: bool = False
+        self._no_autosave:   bool = False
 
-        # per-step tracking (updated by server.py)
+        # per-step tracking (updated by server.py during live operation)
         self.prev_state:      "np.ndarray | None" = None
         self.prev_action_idx: int   = ACTIONS.index(0)
         self.prev_lux:        "float | None" = None
@@ -113,14 +136,14 @@ class RLAgent:
         trend = (0.0 if prev_lux is None
                  else float(np.clip((current_lux - prev_lux) / t, -1.0, 1.0)))
         pa    = ACTIONS[prev_action_idx] / 25.0
-        return np.array([[err, br, trend, pa]], dtype=np.float32)
+        goal  = float(np.clip(target_lux / LUX_GOAL_SCALE, 0.0, 1.0))
+        return np.array([[err, br, trend, pa, goal]], dtype=np.float32)
 
     @staticmethod
     def compute_reward(current_lux: float, target_lux: float,
                        prev_lux: "float | None", tolerance: float = 0.5) -> float:
         t   = max(target_lux, 1.0)
         err = abs(current_lux - t)
-        # Dead band: within ±tolerance lux is considered "at target"
         if err <= tolerance:
             return 2.0
         pct = err / t
@@ -158,8 +181,86 @@ class RLAgent:
         if self.steps % self.target_freq == 0:
             with self._lock:
                 self.target_net.copy_weights_from(self.q_net)
-        if self.steps % 50 == 0:
+        if not self._no_autosave and self.steps % 50 == 0:
             self.save()
+
+    # ── simulation training ───────────────────────────────────────────────────
+
+    def simulate(self, calib, goals: list, n_episodes: int = 1000,
+                 steps_per_ep: int = 30, noise_std: float = 2.0,
+                 progress_cb=None) -> None:
+        """
+        Offline training on a digital twin of the calibration curve.
+
+        goals        : list of target lux values; each episode draws one at random.
+        progress_cb  : optional callable(episode, total, epsilon) for status updates.
+
+        On completion calls set_live_mode() and saves the model.
+        """
+        twin      = DigitalTwin(calib, noise_std)
+        tolerance = 0.5
+        lux_min   = max(1.0, min(p["lux"] for p in calib.points))
+        lux_max   = max(lux_min + 1.0, calib.max_lux)
+
+        self._no_autosave = True
+        try:
+            for ep in range(n_episodes):
+                # Sample goal lux
+                if goals:
+                    goal_lux = float(random.choice(goals))
+                else:
+                    goal_lux = float(np.random.uniform(lux_min, lux_max))
+                goal_lux = max(1.0, goal_lux)
+
+                # Warm-start brightness near the curve estimate (with position noise)
+                init_br  = calib.brightness_for_lux(goal_lux)
+                init_br  = float(np.clip(init_br + np.random.normal(0, 5), 5, 100))
+                cur_br, cur_lux = twin.step(init_br, 0)
+
+                prev_lux = None
+                prev_idx = ACTIONS.index(0)
+                prev_s   = None
+
+                for _ in range(steps_per_ep):
+                    state      = self.build_state(cur_lux, goal_lux, cur_br,
+                                                  prev_lux, prev_idx)
+                    action_idx = self.act(state)
+                    delta      = ACTIONS[action_idx]
+
+                    new_br, new_lux = twin.step(cur_br, delta)
+                    reward          = self.compute_reward(new_lux, goal_lux,
+                                                          cur_lux, tolerance)
+                    new_state       = self.build_state(new_lux, goal_lux, new_br,
+                                                       cur_lux, action_idx)
+
+                    if prev_s is not None:
+                        self.remember(prev_s, prev_idx, reward, state)
+                        self.replay()
+
+                    prev_s   = state
+                    prev_idx = action_idx
+                    prev_lux = cur_lux
+                    cur_lux  = new_lux
+                    cur_br   = new_br
+
+                # Checkpoint and progress update every 100 episodes
+                if ep % 100 == 0 or ep == n_episodes - 1:
+                    self.save()
+                    if progress_cb:
+                        progress_cb(ep + 1, n_episodes, self.epsilon)
+
+        finally:
+            self._no_autosave = False
+
+        self.set_live_mode()
+        self.save()
+
+    def set_live_mode(self) -> None:
+        """No exploration, very low LR — only fine-tunes in real operation."""
+        self.epsilon       = 0.0
+        self.epsilon_min   = 0.0
+        self.lr            = self.lr_live
+        self.trained_by_sim = True
 
     # ── persistence ───────────────────────────────────────────────────────────
 
@@ -167,9 +268,13 @@ class RLAgent:
         try:
             os.makedirs("/data", exist_ok=True)
             with open(MODEL_PATH, "w") as fh:
-                json.dump({"q_net": self.q_net.to_dict(),
-                           "epsilon": self.epsilon,
-                           "steps": self.steps}, fh)
+                json.dump({
+                    "q_net":          self.q_net.to_dict(),
+                    "epsilon":        self.epsilon,
+                    "steps":          self.steps,
+                    "lr":             self.lr,
+                    "trained_by_sim": self.trained_by_sim,
+                }, fh)
         except Exception:
             pass
 
@@ -177,11 +282,16 @@ class RLAgent:
         try:
             with open(MODEL_PATH) as fh:
                 d = json.load(fh)
+            net = _NN.from_dict(d["q_net"])
+            if net.sizes[0] != STATE_SIZE:
+                return  # incompatible checkpoint (e.g. old 4D model) — keep fresh init
             with self._lock:
-                self.q_net = _NN.from_dict(d["q_net"])
+                self.q_net = net
                 self.target_net.copy_weights_from(self.q_net)
-            self.epsilon = float(d.get("epsilon", self.epsilon))
-            self.steps   = int(d.get("steps", 0))
+            self.epsilon        = float(d.get("epsilon", self.epsilon))
+            self.steps          = int(d.get("steps", 0))
+            self.lr             = float(d.get("lr", self.lr))
+            self.trained_by_sim = bool(d.get("trained_by_sim", False))
         except Exception:
             pass
 
@@ -191,21 +301,24 @@ class RLAgent:
             self.target_net = _NN(self.LAYERS)
             self.target_net.copy_weights_from(self.q_net)
         self.memory.clear()
-        self.epsilon     = 0.60
-        self.steps       = 0
-        self.prev_state  = None
-        self.prev_lux    = None
-        self.last_reward = None
-        self.last_delta  = 0
+        self.epsilon        = 0.60
+        self.lr             = 5e-4
+        self.trained_by_sim = False
+        self.steps          = 0
+        self.prev_state     = None
+        self.prev_lux       = None
+        self.last_reward    = None
+        self.last_delta     = 0
 
     # ── info ──────────────────────────────────────────────────────────────────
 
     def info(self) -> dict:
         return {
-            "epsilon":     round(self.epsilon, 4),
-            "train_steps": self.steps,
-            "memory_size": len(self.memory),
-            "last_delta":  self.last_delta,
-            "last_reward": (round(self.last_reward, 3)
-                            if self.last_reward is not None else None),
+            "epsilon":        round(self.epsilon, 4),
+            "train_steps":    self.steps,
+            "memory_size":    len(self.memory),
+            "last_delta":     self.last_delta,
+            "last_reward":    (round(self.last_reward, 3)
+                               if self.last_reward is not None else None),
+            "trained_by_sim": self.trained_by_sim,
         }

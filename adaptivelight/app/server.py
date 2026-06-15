@@ -36,6 +36,11 @@ DEFAULT_CONFIG = {
     "rl_sun_threshold": 0.0,   # degrees; RL runs only when sun elevation < this
     "rl_action_cooldown":  3.0, # seconds between successive RL brightness adjustments
     "rl_lux_tolerance":    0.5, # dead band ± lux around target; no command issued inside
+    # Simulation training
+    "rl_sim_episodes":     1000, # number of simulation episodes
+    "rl_sim_steps_per_ep":   30, # environment steps per episode
+    "rl_sim_noise_std":     2.0, # Gaussian lux noise std dev for digital twin
+    "rl_sim_goals":          [], # explicit goal lux values; empty = auto from calibration
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -132,6 +137,17 @@ _calib_status: dict = {
     "timestamp":          None,
 }
 
+_sim_lock = threading.Lock()
+_sim_status: dict = {
+    "running":    False,
+    "episode":    0,
+    "total":      0,
+    "epsilon":    0.0,
+    "done":       False,
+    "error":      None,
+    "trained_at": None,
+}
+
 
 def _get_rl_agent() -> RLAgent:
     global _rl_agent
@@ -214,16 +230,70 @@ def _run_calibration_thread() -> None:
         cfg2   = load_config()
         target = float(cfg2.get("rl_target_lux", 100))
         _set_rl_brightness_rest(calib.brightness_for_lux(target), lights)
-        # Reset RL so it fine-tunes from the new starting point
-        agent = _get_rl_agent()
-        agent.memory.clear()
-        agent.prev_state = None
-        agent.prev_lux   = None
+
+        # Auto-start simulation training on the freshly measured curve
+        threading.Thread(target=_run_simulation_thread, daemon=True).start()
 
     except Exception as exc:
         with _calib_lock:
             _calib_status.update(running=False, error=str(exc))
         app.logger.error("Calibration failed: %s", exc)
+
+
+def _run_simulation_thread() -> None:
+    """Train the RL agent in simulation using the calibration curve as digital twin."""
+    global _sim_status
+    cfg   = load_config()
+    calib = load_calibration()
+
+    if not calib:
+        with _sim_lock:
+            _sim_status.update(running=False,
+                               error="Kalibrace chybí — nejprve proveďte kalibraci")
+        return
+
+    with _calib_lock:
+        if _calib_status["running"]:
+            with _sim_lock:
+                _sim_status.update(running=False,
+                                   error="Kalibrace stále probíhá — počkejte na dokončení")
+            return
+
+    goals     = [float(g) for g in cfg.get("rl_sim_goals", []) if float(g) > 0]
+    n_ep      = max(1, int(cfg.get("rl_sim_episodes",    1000)))
+    steps_ep  = max(5, int(cfg.get("rl_sim_steps_per_ep",  30)))
+    noise     = max(0.0, float(cfg.get("rl_sim_noise_std",  2.0)))
+
+    with _sim_lock:
+        _sim_status.update(running=True, episode=0, total=n_ep,
+                           epsilon=0.6, done=False, error=None, trained_at=None)
+
+    agent = _get_rl_agent()
+    # Reset training state so simulation starts fresh while keeping live-mode flag until done
+    agent.epsilon        = 0.60
+    agent.epsilon_min    = 0.05
+    agent.epsilon_decay  = 0.99
+    agent.lr             = 5e-4
+    agent.trained_by_sim = False
+    agent.memory.clear()
+    agent.prev_state     = None
+    agent.prev_lux       = None
+
+    def _progress(ep: int, total: int, eps: float) -> None:
+        with _sim_lock:
+            _sim_status.update(episode=ep, total=total, epsilon=round(eps, 4))
+
+    try:
+        agent.simulate(calib, goals, n_ep, steps_ep, noise, _progress)
+        ts = _now()
+        with _sim_lock:
+            _sim_status.update(running=False, episode=n_ep, done=True,
+                               epsilon=0.0, trained_at=ts)
+        app.logger.info("RL simulation done: %d episodes, %d total steps", n_ep, agent.steps)
+    except Exception as exc:
+        with _sim_lock:
+            _sim_status.update(running=False, error=str(exc))
+        app.logger.error("RL simulation failed: %s", exc)
 
 
 def _init_sun_elevation() -> None:
@@ -642,6 +712,9 @@ def rl_status():
         br = _rl_brightness
     with _calib_lock:
         calib_running = _calib_status["running"]
+    with _sim_lock:
+        sim_running = _sim_status["running"]
+        sim_done    = _sim_status["done"]
     calib = load_calibration()
     return jsonify({
         **agent.info(),
@@ -653,6 +726,8 @@ def rl_status():
         "calibrated":         calib is not None,
         "calib_running":      calib_running,
         "calib_max_lux":      round(calib.max_lux, 1) if calib else None,
+        "sim_running":        sim_running,
+        "sim_done":           sim_done,
     })
 
 
@@ -663,7 +738,25 @@ def rl_reset():
         os.remove("/data/rl_model.json")
     except FileNotFoundError:
         pass
+    with _sim_lock:
+        _sim_status.update(running=False, episode=0, total=0, epsilon=0.0,
+                           done=False, error=None, trained_at=None)
     return jsonify({"ok": True})
+
+
+@app.route("/api/rl/simulate", methods=["POST"])
+def rl_simulate():
+    with _sim_lock:
+        if _sim_status["running"]:
+            return jsonify({"error": "Simulace již probíhá"}), 409
+    threading.Thread(target=_run_simulation_thread, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/rl/simulate/status")
+def rl_simulate_status():
+    with _sim_lock:
+        return jsonify(dict(_sim_status))
 
 
 @app.route("/api/rl/calibration")
