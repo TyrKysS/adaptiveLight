@@ -426,14 +426,16 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     agent = _get_rl_agent()
 
     # ── Spike filter ──────────────────────────────────────────────────────────
-    # Skip readings where lux jumped unrealistically (sensor covered/uncovered,
-    # sudden light switch by someone else). Threshold: more than 2× target in one step.
+    # Skip readings where lux changed more than 70 % of target in a single step
+    # (sensor covered/uncovered, sudden manual light switch).  For target=50 this
+    # is a 35-lux jump — larger than any lamp adjustment but smaller than full
+    # coverage.  We slide prev_lux forward so the *next* event starts cleanly.
     if agent.prev_lux is not None:
-        spike_thr = max(target * 2.0, 30.0)
+        spike_thr = max(target * 0.7, 20.0)
         if abs(lux_val - agent.prev_lux) > spike_thr:
             app.logger.warning("RL: lux spike %.1f→%.1f (thr %.0f), skipping step",
                                agent.prev_lux, lux_val, spike_thr)
-            agent.prev_lux = lux_val   # slide window forward so next step is clean
+            agent.prev_lux = lux_val
             return
 
     tolerance = float(cfg.get("rl_lux_tolerance", 0.5))
@@ -497,7 +499,7 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         agent.remember(agent.prev_state, agent.prev_action_idx, reward, state)
         agent.replay()
 
-    action_idx = agent.act(state)
+    action_idx = agent.act_guarded(state, lux_val, target)
     delta      = ACTIONS[action_idx]
 
     # Always update state tracking and cooldown

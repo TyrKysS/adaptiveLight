@@ -162,6 +162,32 @@ class RLAgent:
         with self._lock:
             return int(np.argmax(self.q_net.predict(state)))
 
+    def act_guarded(self, state: np.ndarray,
+                    lux_val: float, target_lux: float) -> int:
+        """
+        Choose action with a directional safety guard for large lux errors.
+
+        When lux deviates more than 50 % from target, the action is restricted
+        to the correct direction so the network cannot move brightness the wrong
+        way regardless of what Q-values it learned for out-of-distribution states
+        (e.g. sensor covered → lux≈0 while brightness is still high).
+
+        Inside the ±50 % band, behaviour is identical to act().
+        """
+        err_ratio = (lux_val - target_lux) / max(target_lux, 1.0)
+        if err_ratio < -0.5:
+            allowed = [i for i, a in enumerate(ACTIONS) if a >= 0]   # only increase
+        elif err_ratio > 0.5:
+            allowed = [i for i, a in enumerate(ACTIONS) if a <= 0]   # only decrease
+        else:
+            return self.act(state)   # normal ε-greedy, no restriction
+
+        if random.random() < self.epsilon:
+            return random.choice(allowed)
+        with self._lock:
+            qv = self.q_net.predict(state)[0]
+        return int(max(allowed, key=lambda i: qv[i]))
+
     # ── training ──────────────────────────────────────────────────────────────
 
     def remember(self, s: np.ndarray, a: int, r: float, s2: np.ndarray) -> None:
@@ -229,14 +255,21 @@ class RLAgent:
                 for _ in range(steps_per_ep):
                     state      = self.build_state(cur_lux, goal_lux, cur_br,
                                                   prev_lux, prev_idx)
-                    action_idx = self.act(state)
+                    action_idx = self.act_guarded(state, cur_lux, goal_lux)
                     delta      = ACTIONS[action_idx]
 
                     new_br, new_lux = twin.step(cur_br, delta)
-                    reward          = self.compute_reward(new_lux, goal_lux,
-                                                          cur_lux, tolerance)
-                    new_state       = self.build_state(new_lux, goal_lux, new_br,
-                                                       cur_lux, action_idx)
+
+                    # 5 % of steps: inject a disturbance (sensor covered → lux≈0,
+                    # or sudden bright ambient → lux≫max). Teaches the network the
+                    # correct response for out-of-distribution sensor readings.
+                    if random.random() < 0.05:
+                        new_lux = 0.0 if random.random() < 0.5 else lux_max * 2.0
+
+                    reward    = self.compute_reward(new_lux, goal_lux,
+                                                    cur_lux, tolerance)
+                    new_state = self.build_state(new_lux, goal_lux, new_br,
+                                                 cur_lux, action_idx)
 
                     if prev_s is not None:
                         self.remember(prev_s, prev_idx, reward, state)
