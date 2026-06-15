@@ -212,9 +212,14 @@ class RLAgent:
                     goal_lux = float(np.random.uniform(lux_min, lux_max))
                 goal_lux = max(1.0, goal_lux)
 
-                # Warm-start brightness near the curve estimate (with position noise)
-                init_br  = calib.brightness_for_lux(goal_lux)
-                init_br  = float(np.clip(init_br + np.random.normal(0, 5), 5, 100))
+                # 25 % of episodes start from a random brightness across the full range.
+                # This teaches the agent what to do at extremes it might reach in real life
+                # (e.g. brightness=5 % with lux still below target due to ambient light).
+                if random.random() < 0.25:
+                    init_br = float(np.random.uniform(5, 100))
+                else:
+                    init_br = calib.brightness_for_lux(goal_lux)
+                    init_br = float(np.clip(init_br + np.random.normal(0, 5), 5, 100))
                 cur_br, cur_lux = twin.step(init_br, 0)
 
                 prev_lux = None
@@ -256,9 +261,9 @@ class RLAgent:
         self.save()
 
     def set_live_mode(self) -> None:
-        """No exploration, very low LR — only fine-tunes in real operation."""
-        self.epsilon       = 0.0
-        self.epsilon_min   = 0.0
+        """Minimal exploration, very low LR — fine-tunes in real operation."""
+        self.epsilon       = 0.05   # residual exploration prevents permanent stuck states
+        self.epsilon_min   = 0.05
         self.lr            = self.lr_live
         self.trained_by_sim = True
 

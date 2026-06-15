@@ -125,6 +125,7 @@ _rl_brightness: float = 50.0   # brightness (0-100 %) tracked by RL
 _rl_last_action_ts: float = 0.0
 _rl_lock = threading.Lock()
 _sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
+_rl_boundary_steps: int = 0    # consecutive steps stuck at min/max brightness
 
 _calib_lock = threading.Lock()
 _calib_status: dict = {
@@ -400,7 +401,7 @@ async def _apply_rule(ws, entity_id: str, lux_val: float, mid: list) -> None:
 
 async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     """RL brightness regulation — called from WebSocket event loop."""
-    global _rl_brightness, _rl_last_action_ts
+    global _rl_brightness, _rl_last_action_ts, _rl_boundary_steps
     cfg    = load_config()
     lights = cfg.get("rl_output_lights", [])
     target = float(cfg.get("rl_target_lux", 100))
@@ -422,18 +423,67 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         if _calib_status["running"]:
             return
 
-    agent     = _get_rl_agent()
+    agent = _get_rl_agent()
+
+    # ── Spike filter ──────────────────────────────────────────────────────────
+    # Skip readings where lux jumped unrealistically (sensor covered/uncovered,
+    # sudden light switch by someone else). Threshold: more than 2× target in one step.
+    if agent.prev_lux is not None:
+        spike_thr = max(target * 2.0, 30.0)
+        if abs(lux_val - agent.prev_lux) > spike_thr:
+            app.logger.warning("RL: lux spike %.1f→%.1f (thr %.0f), skipping step",
+                               agent.prev_lux, lux_val, spike_thr)
+            agent.prev_lux = lux_val   # slide window forward so next step is clean
+            return
+
     tolerance = float(cfg.get("rl_lux_tolerance", 0.5))
     in_band   = abs(lux_val - target) <= tolerance
 
-    # Warm start: on first action use calibration curve instead of 50 % default
+    # ── Stuck-at-boundary detection ───────────────────────────────────────────
+    # If the agent has been at minimum brightness while lux is still well below
+    # target for several consecutive steps, something is wrong (e.g. daytime ambient
+    # less than target, or policy stuck). Force a warm-start to re-anchor.
+    with _rl_lock:
+        cur_br = _rl_brightness
+
+    if cur_br <= 5.5 and lux_val < target * 0.90 and not in_band:
+        _rl_boundary_steps += 1
+        if _rl_boundary_steps >= 6:
+            app.logger.info("RL: stuck at min brightness (%.1f lux vs %.1f target), forcing warm-start",
+                            lux_val, target)
+            agent.prev_state = None
+            agent.prev_lux   = None
+            _rl_boundary_steps = 0
+    else:
+        _rl_boundary_steps = 0
+
+    # ── Warm-start ────────────────────────────────────────────────────────────
+    # On first step (or after a forced reset), command the light to the
+    # calibration-curve brightness so the *next* lux reading reflects an accurate
+    # starting point. Return immediately — the agent acts on the following event.
     calib = load_calibration()
     if calib and agent.prev_state is None:
-        approx_br = calib.brightness_for_lux(target)
+        approx_br = float(np.clip(calib.brightness_for_lux(target), 5, 100))
         with _rl_lock:
-            _rl_brightness = float(np.clip(approx_br, 5, 100))
-        app.logger.info("RL warm-start: target %.1f lx → %.0f%% brightness (from curve)",
-                        target, approx_br)
+            _rl_brightness = approx_br
+        b255 = int(approx_br / 100 * 255)
+        for lid in lights:
+            mid[0] += 1
+            await ws.send_json({
+                "id": mid[0], "type": "call_service",
+                "domain": "light", "service": "turn_on",
+                "service_data": {"entity_id": lid, "brightness": b255},
+            })
+        # Build a placeholder state so warm-start doesn't fire again next event
+        placeholder = RLAgent.build_state(lux_val, target, approx_br, None, ACTIONS.index(0))
+        agent.prev_state      = placeholder
+        agent.prev_action_idx = ACTIONS.index(0)
+        agent.prev_lux        = lux_val
+        _rl_last_action_ts    = now
+        app.logger.info("RL warm-start: target %.1f lx → %.0f%% brightness", target, approx_br)
+        _set_status(last_run=_now(), action=f"rl_warmstart_{int(approx_br)}",
+                    lux=round(lux_val, 1), threshold=target, trigger=entity_id, error=None)
+        return
 
     with _rl_lock:
         cur_br = _rl_brightness
