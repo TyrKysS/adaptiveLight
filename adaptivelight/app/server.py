@@ -126,6 +126,7 @@ _rl_last_action_ts: float = 0.0
 _rl_lock = threading.Lock()
 _sun_elevation: float = 90.0   # cached from sun.sun; 90 = assume day until first update
 _rl_boundary_steps: int = 0    # consecutive steps stuck at min/max brightness
+_rl_light_is_off:   bool = False  # True while lamp is off due to ambient lux override
 
 _calib_lock = threading.Lock()
 _calib_status: dict = {
@@ -401,7 +402,7 @@ async def _apply_rule(ws, entity_id: str, lux_val: float, mid: list) -> None:
 
 async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
     """RL brightness regulation — called from WebSocket event loop."""
-    global _rl_brightness, _rl_last_action_ts, _rl_boundary_steps
+    global _rl_brightness, _rl_last_action_ts, _rl_boundary_steps, _rl_light_is_off
     cfg    = load_config()
     lights = cfg.get("rl_output_lights", [])
     target = float(cfg.get("rl_target_lux", 100))
@@ -423,7 +424,17 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
         if _calib_status["running"]:
             return
 
-    agent = _get_rl_agent()
+    agent     = _get_rl_agent()
+    tolerance = float(cfg.get("rl_lux_tolerance", 0.5))
+
+    # ── Ambient override: stay off until lux drops back below target ──────────
+    if _rl_light_is_off:
+        if lux_val > target + tolerance:
+            return  # ambient still above target — keep light off, skip cooldown bump
+        # Lux fell below target: clear flag and fall through to warm-start
+        _rl_light_is_off = False
+        agent.prev_state = None
+        agent.prev_lux   = None
 
     # ── Spike filter ──────────────────────────────────────────────────────────
     # Skip readings where lux changed more than 70 % of target in a single step
@@ -438,8 +449,7 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
             agent.prev_lux = lux_val
             return
 
-    tolerance = float(cfg.get("rl_lux_tolerance", 0.5))
-    in_band   = abs(lux_val - target) <= tolerance
+    in_band = abs(lux_val - target) <= tolerance
 
     # ── Stuck-at-boundary detection ───────────────────────────────────────────
     # If the agent has been at minimum brightness while lux is still well below
@@ -458,6 +468,31 @@ async def _apply_rl(ws, entity_id: str, lux_val: float, mid: list) -> None:
             _rl_boundary_steps = 0
     else:
         _rl_boundary_steps = 0
+
+    # ── Ambient overflow: turn off when lamp cannot reduce lux further ─────────
+    # At minimum brightness the lamp cannot decrease lux. If ambient light alone
+    # keeps lux above the setpoint, turn the light off and set the flag so the
+    # warm-start below does not immediately switch it back on.
+    if cur_br <= 5.5 and lux_val > target + tolerance:
+        if not _rl_light_is_off:
+            for lid in lights:
+                mid[0] += 1
+                await ws.send_json({
+                    "id": mid[0], "type": "call_service",
+                    "domain": "light", "service": "turn_off",
+                    "service_data": {"entity_id": lid},
+                })
+            app.logger.info("RL: ambient lux %.1f exceeds target %.1f at min brightness → turn off",
+                            lux_val, target)
+            _rl_light_is_off   = True
+            agent.prev_state   = None
+            agent.prev_lux     = None
+            _rl_boundary_steps = 0
+            _rl_last_action_ts = now
+            _set_status(last_run=_now(), action="rl_ambient_off",
+                        lux=round(lux_val, 1), threshold=target,
+                        trigger=entity_id, error=None)
+        return
 
     # ── Warm-start ────────────────────────────────────────────────────────────
     # On first step (or after a forced reset), command the light to the
